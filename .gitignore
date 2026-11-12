@@ -1,0 +1,63 @@
+# ==============================================================================
+# MovieRag .gitignore — Track Only Required Source Code, Pipeline & Notebooks
+# ==============================================================================
+
+# 1. Reference Papers, Duplicate Upstream Folder & Benchmark Static Assets
+*.pdf
+VideoRAG-algorithm/
+Animated_AD/resources/
+Animated_AD/teasor.png
+Animated_AD/build_character_bank/pipeline.png
+MovieRAG/VideoRAG_cover.png
+MovieRAG/VideoRAG.png
+MovieRAG/reproduce/
+
+# 2. Local / Drive Runtime Data, Checkpoints & Extracted Outputs
+workdir/
+char_bank/
+videos/
+models_cache/
+tgrp_tracks.jsonl*
+
+# 3. Model Weights, Embeddings & Binary Artifacts
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.npz
+*.bin
+*.h5
+
+# 4. Media Files (Videos & Audio)
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.mp3
+*.wav
+*.flac
+*.m4a
+
+# 5. Python, Jupyter & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+ENV/
+.env
+.env.*
+
+# 6. OS & Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
