@@ -3,14 +3,15 @@
 
 1. Step 3.1 (Per-Shot TGRP Tracking):
    - Reads canonical `shots` from `shots_and_scenes.json` (where shots >20s are already subdivided).
-   - Decodes frames one shot at a time to a temporary folder to keep disk usage minimal.
-   - Samples 3 seed frames per shot, runs `google/owlv2-large-patch14-ensemble` (`threshold=0.1`,
-     NMS `iou_threshold=0.5`, capped to top-8 character boxes per seed frame), prompts `SAM 2.1`
-     (`sam2.1_hiera_l.yaml`) under `torch.inference_mode()` + `bfloat16` autocast for bidirectional
-     propagation, converts mask logits to `[x1, y1, x2, y2]` directly on GPU (preventing 2D mask RAM
-     blowup), and filters tracks via tripartite graph matching (>=2 seed sets, IoU >= 0.5).
-   - Appends each completed shot to `tgrp_tracks.jsonl` for crash-resumable execution and frees
-     `SAM 2.1` inference state after every shot.
+   - Decodes frames one shot at a time in small 32-frame chunks to a temporary folder and frees the
+     decoded frame buffer immediately before tracking begins.
+   - Samples 3 seed frames per shot, runs `google/owlv2-large-patch14-ensemble` (with NMS `iou=0.5`
+     and capped to top-5 character boxes per seed frame), prompts `SAM 2.1` (`sam2.1_hiera_l.yaml`)
+     under `torch.inference_mode()` + `bfloat16` autocast for bidirectional propagation, converts
+     mask logits to `[x1, y1, x2, y2]` directly on GPU (zero 2D masks in CPU RAM), and filters
+     tracks via tripartite graph matching (>=2 seed sets, IoU >= 0.5).
+   - Explicitly calls `inference_state.clear()` and `inference_state = None` BEFORE `gc.collect()`
+     and `torch.cuda.empty_cache()` after every shot so `inference_state["images"]` never leaks RAM.
 2. Step 3.2 (DINOv2 Track Classification & Global Frame Mapping):
    - Samples up to 5 frames along each track, crops the character region, extracts features with
      the fine-tuned `DINOv2` model from Stage A2, and computes top-3 average cosine similarity
@@ -197,8 +198,8 @@ def run_per_shot_tgrp(
     shots: List[Dict[str, Any]],
     tgrp_jsonl_path: str,
     sam2_checkpoint: str,
-    max_boxes_per_seed: int = 8,
-    min_box_area_ratio: float = 0.004,
+    max_boxes_per_seed: int = 5,
+    min_box_area_ratio: float = 0.005,
     restart: bool = False,
 ) -> str:
     """Run OWLv2 + SAM 2.1 bidirectional tracking + tripartite matching per shot with JSONL resume."""
@@ -214,7 +215,6 @@ def run_per_shot_tgrp(
         load_completed_shots,
         merge_tracks,
         non_max_suppression,
-        release_inference_state,
     )
     from transformers import Owlv2ForObjectDetection, Owlv2Processor
 
@@ -259,22 +259,37 @@ def run_per_shot_tgrp(
     use_autocast = device == "cuda"
     autocast_dtype = torch.bfloat16 if (use_autocast and torch.cuda.is_bf16_supported()) else torch.float16
 
+    # Use a local disk scratch base outside RAM-backed /tmp if /content exists
+    scratch_base = "/content/tgrp_scratch" if os.path.isdir("/content") else None
+    if scratch_base:
+        os.makedirs(scratch_base, exist_ok=True)
+
     with open(tgrp_jsonl_path, "a", encoding="utf-8") as out_f:
-        for shot in tqdm(pending_shots, desc="TGRP Per-Shot Tracking"):
+        for shot_counter, shot in enumerate(tqdm(pending_shots, desc="TGRP Per-Shot Tracking")):
             shot_id = int(shot["shot_idx"])
             start_frame = max(0, min(int(shot["start_frame"]), total_frames))
             end_frame = max(0, min(int(shot["end_frame"]), total_frames))
             if start_frame >= end_frame:
                 continue
 
+            # Periodically re-create Decord VideoReader every 25 shots so C++ FFmpeg packet buffers never accumulate
+            if shot_counter > 0 and shot_counter % 25 == 0:
+                del vr
+                gc.collect()
+                vr = VideoReader(video_path, ctx=cpu(0))
+
             inference_state = None
-            with tempfile.TemporaryDirectory(prefix=f"tgrp_shot_{shot_id}_") as shot_dir:
+            with tempfile.TemporaryDirectory(prefix=f"tgrp_shot_{shot_id}_", dir=scratch_base) as shot_dir:
                 try:
-                    frame_indices = list(range(start_frame, end_frame))
-                    frames_np = vr.get_batch(frame_indices).asnumpy()
-                    for global_f_idx, frame_rgb in zip(frame_indices, frames_np):
-                        frame_path = os.path.join(shot_dir, f"{global_f_idx}.jpg")
-                        cv2.imwrite(frame_path, frame_rgb[:, :, ::-1])
+                    # Decode in small 32-frame chunks and free immediately so RAM stays flat
+                    for chunk_s in range(start_frame, end_frame, 32):
+                        chunk_e = min(chunk_s + 32, end_frame)
+                        chunk_indices = list(range(chunk_s, chunk_e))
+                        batch_np = vr.get_batch(chunk_indices).asnumpy()
+                        for global_f_idx, frame_rgb in zip(chunk_indices, batch_np):
+                            frame_path = os.path.join(shot_dir, f"{global_f_idx}.jpg")
+                            cv2.imwrite(frame_path, frame_rgb[:, :, ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                        del batch_np
 
                     frame_names = sorted(
                         [p for p in os.listdir(shot_dir) if p.lower().endswith(".jpg")],
@@ -287,8 +302,8 @@ def run_per_shot_tgrp(
                     save_shot_results: Dict[str, Any] = {
                         "video_idx": movie_id,
                         "shot_idx": shot_id,
-                        "start_idx": int(frame_indices[0]),
-                        "end_idx": int(frame_indices[-1]),
+                        "start_idx": int(start_frame),
+                        "end_idx": int(end_frame - 1),
                     }
 
                     rng = random.Random(f"{movie_id}:{shot_id}")
@@ -315,12 +330,22 @@ def run_per_shot_tgrp(
 
                         target_sizes = torch.Tensor([image.size[::-1]])
                         detections = processor.post_process_object_detection(
-                            outputs=outputs, threshold=0.1, target_sizes=target_sizes
+                            outputs=outputs, threshold=0.15, target_sizes=target_sizes
                         )
                         input_boxes = detections[0]["boxes"].detach().cpu().numpy()
+                        bbox_scores = detections[0]["scores"].detach().cpu().numpy()
+
+                        # Fallback to threshold 0.10 only if nothing cleared 0.15
+                        if input_boxes.shape[0] == 0:
+                            detections = processor.post_process_object_detection(
+                                outputs=outputs, threshold=0.10, target_sizes=target_sizes
+                            )
+                            input_boxes = detections[0]["boxes"].detach().cpu().numpy()
+                            bbox_scores = detections[0]["scores"].detach().cpu().numpy()
+
+                        del inputs, outputs, detections
                         if input_boxes.shape[0] == 0:
                             continue
-                        bbox_scores = detections[0]["scores"].detach().cpu().numpy()
 
                         # Filter tiny noise detections before NMS
                         valid_mask = np.array([box_area(b) >= min_box_area for b in input_boxes], dtype=bool)
@@ -332,7 +357,7 @@ def run_per_shot_tgrp(
                         selected_bboxes, selected_scores = non_max_suppression(
                             input_boxes, bbox_scores, iou_threshold=0.5
                         )
-                        # Cap to top-K highest scoring character boxes per seed frame so SAM 2.1 stays fast
+                        # Cap to top-K highest scoring character boxes per seed frame
                         if len(selected_bboxes) > max_boxes_per_seed:
                             selected_bboxes = selected_bboxes[:max_boxes_per_seed]
                             selected_scores = selected_scores[:max_boxes_per_seed]
@@ -349,7 +374,12 @@ def run_per_shot_tgrp(
                             dtype=autocast_dtype,
                             enabled=use_autocast,
                         ):
-                            inference_state = video_predictor.init_state(video_path=shot_dir)
+                            # offload_video_to_cpu=True + offload_state_to_cpu=False keeps VRAM low,
+                            # and we explicitly clear inference_state["images"] in finally!
+                            inference_state = video_predictor.init_state(
+                                video_path=shot_dir,
+                                offload_video_to_cpu=True,
+                            )
 
                             for frame_idx_str, anns in key_frame_detection_results.items():
                                 ann_frame_idx = int(frame_idx_str)
@@ -366,7 +396,6 @@ def run_per_shot_tgrp(
                                     )
 
                                 # Convert mask logits -> [x1, y1, x2, y2] immediately on GPU!
-                                # Never store full-res 2D boolean masks in CPU RAM.
                                 video_segments: Dict[int, Dict[int, List[int]]] = {}
                                 for out_f_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
                                     inference_state
@@ -405,8 +434,18 @@ def run_per_shot_tgrp(
                     oom_shot_ids.append(shot_id)
                     print(f"[Stage A3.1] WARNING: CUDA OOM on shot {shot_id} ({exc}); leaving for retry.")
                 finally:
-                    release_inference_state(video_predictor, inference_state)
+                    # Crucial: clear inference_state dict (including 'images' tensor) BEFORE gc.collect()!
+                    if inference_state is not None:
+                        try:
+                            video_predictor.reset_state(inference_state)
+                        except Exception:
+                            pass
+                        if isinstance(inference_state, dict):
+                            inference_state.clear()
                     inference_state = None
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
     del video_predictor, owlv2_model, processor, vr
     gc.collect()
@@ -544,6 +583,7 @@ def classify_tracks_and_map_frames(
                 cropped_pil = crop_object(np.array(pil_img), bbox, mask)
                 crop_tensors.append(transform(cropped_pil))
 
+            del decoded_frames
             batch_tensor = torch.stack(crop_tensors).to(device)
             with torch.inference_mode():
                 query_features = model(batch_tensor).clone().detach().cpu().numpy()
@@ -740,7 +780,7 @@ def extract_adaptive_annotated_keyframes(
 
                 decoded_candidates = vr.get_batch(candidate_pool).asnumpy()
                 best_frame_idx = candidate_pool[0]
-                best_frame_rgb = decoded_candidates[0]
+                best_frame_rgb = decoded_candidates[0].copy()
                 best_sharpness = -1.0
 
                 for cand_f_idx, cand_rgb in zip(candidate_pool, decoded_candidates):
@@ -749,8 +789,9 @@ def extract_adaptive_annotated_keyframes(
                     if sharpness > best_sharpness:
                         best_sharpness = sharpness
                         best_frame_idx = int(cand_f_idx)
-                        best_frame_rgb = cand_rgb
+                        best_frame_rgb = cand_rgb.copy()
 
+                del decoded_candidates
                 pred = frames_predictions.get(str(best_frame_idx), {})
                 best_box_per_char: Dict[str, Tuple[float, List[int]]] = {}
                 for bbox, label, score in zip(
@@ -828,7 +869,7 @@ def run_stage3_visual_recog(
     mask_classify: bool = False,
     visual_prompt_thresh: float = 0.45,
     voice_harvest_thresh: float = 0.60,
-    max_boxes_per_seed: int = 8,
+    max_boxes_per_seed: int = 5,
     restart: bool = False,
 ) -> Dict[str, Any]:
     """Run all 3 steps of Stage A3 and return summary statistics."""
@@ -928,9 +969,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max_boxes_per_seed",
-        default=8,
+        default=5,
         type=int,
-        help="Maximum OWLv2 boxes propagated per seed frame (default: 8)",
+        help="Maximum OWLv2 boxes propagated per seed frame (default: 5)",
     )
     parser.add_argument("--restart", action="store_true", help="Discard existing tgrp_tracks.jsonl and restart TGRP")
     return parser.parse_args()
