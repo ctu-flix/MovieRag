@@ -14,7 +14,7 @@ MovieRAG/reproduce/
 
 # 2. Local / Drive Runtime Data, Checkpoints & Extracted Outputs
 workdir/
-char_bank/
+char_bank/*/raw_images/
 videos/
 models_cache/
 tgrp_tracks.jsonl*

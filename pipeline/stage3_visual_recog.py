@@ -5,8 +5,10 @@
    - Reads canonical `shots` from `shots_and_scenes.json` (where shots >20s are already subdivided).
    - Decodes frames one shot at a time to a temporary folder to keep disk usage minimal.
    - Samples 3 seed frames per shot, runs `google/owlv2-large-patch14-ensemble` (`threshold=0.1`,
-     NMS `iou_threshold=0.5`), prompts `SAM 2.1` (`sam2.1_hiera_l.yaml`) for bidirectional
-     mask propagation, and filters tracks via tripartite graph matching (>=2 seed sets, IoU >= 0.5).
+     NMS `iou_threshold=0.5`, capped to top-8 character boxes per seed frame), prompts `SAM 2.1`
+     (`sam2.1_hiera_l.yaml`) under `torch.inference_mode()` + `bfloat16` autocast for bidirectional
+     propagation, converts mask logits to `[x1, y1, x2, y2]` directly on GPU (preventing 2D mask RAM
+     blowup), and filters tracks via tripartite graph matching (>=2 seed sets, IoU >= 0.5).
    - Appends each completed shot to `tgrp_tracks.jsonl` for crash-resumable execution and frees
      `SAM 2.1` inference state after every shot.
 2. Step 3.2 (DINOv2 Track Classification & Global Frame Mapping):
@@ -43,10 +45,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 if TYPE_CHECKING:
     import numpy as np
     import PIL.Image as Image
+    import torch
 
 # Ensure project root and Animated_AD paths are importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pipeline import ensure_animated_ad_paths
+from pipeline import ensure_animated_ad_paths, patch_owlv2_processor
 
 ensure_animated_ad_paths()
 
@@ -98,6 +101,26 @@ def cosine_sim(vec1: np.ndarray, vec2: np.ndarray) -> float:
     if denom == 0.0:
         return 0.0
     return float(np.dot(vec1, vec2) / denom)
+
+
+def mask_logits_to_bbox_gpu(mask_logit_tensor: torch.Tensor) -> Optional[List[int]]:
+    """Convert a single SAM 2.1 mask logit tensor `(1, H, W)` or `(H, W)` to `[x1, y1, x2, y2]` on GPU.
+
+    Avoids copying full-resolution 2D boolean masks to CPU RAM across hundreds of frames.
+    """
+    import torch
+
+    mask_2d = mask_logit_tensor.squeeze() > 0.0
+    ys, xs = torch.where(mask_2d)
+    if ys.numel() == 0:
+        return None
+    x_min = int(xs.min().item())
+    y_min = int(ys.min().item())
+    x_max = int(xs.max().item())
+    y_max = int(ys.max().item())
+    if (x_max - x_min) * (y_max - y_min) <= 0:
+        return None
+    return [x_min, y_min, x_max, y_max]
 
 
 def convert_bbox_to_rectangle_mask(
@@ -174,6 +197,8 @@ def run_per_shot_tgrp(
     shots: List[Dict[str, Any]],
     tgrp_jsonl_path: str,
     sam2_checkpoint: str,
+    max_boxes_per_seed: int = 8,
+    min_box_area_ratio: float = 0.004,
     restart: bool = False,
 ) -> str:
     """Run OWLv2 + SAM 2.1 bidirectional tracking + tripartite matching per shot with JSONL resume."""
@@ -182,18 +207,19 @@ def run_per_shot_tgrp(
     import PIL.Image as Image
     import torch
     from decord import VideoReader, cpu
-    from tqdm import tqdm
     from sam2.build_sam import build_sam2_video_predictor
+    from tqdm import tqdm
     from tgrp import (
         box_area,
-        get_bounding_box_from_mask,
         load_completed_shots,
-        merge_dicts,
         merge_tracks,
         non_max_suppression,
         release_inference_state,
     )
     from transformers import Owlv2ForObjectDetection, Owlv2Processor
+
+    ensure_animated_ad_paths()
+    patch_owlv2_processor()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(os.path.dirname(os.path.abspath(tgrp_jsonl_path)), exist_ok=True)
@@ -214,17 +240,24 @@ def run_per_shot_tgrp(
     else:
         print(f"[Stage A3.1] Starting TGRP across {len(shots)} canonical shots...")
 
-    print("[Stage A3.1] Initializing SAM 2.1 VideoPredictor & OWLv2...")
+    owlv2_source = os.environ.get("OWLV2_MODEL_PATH", "google/owlv2-large-patch14-ensemble")
+    if not os.path.isdir(owlv2_source):
+        owlv2_source = "google/owlv2-large-patch14-ensemble"
+
+    print(f"[Stage A3.1] Initializing SAM 2.1 VideoPredictor & OWLv2 ({owlv2_source})...")
     model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
     video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
-    processor = Owlv2Processor.from_pretrained("google/owlv2-large-patch14-ensemble")
-    owlv2_model = Owlv2ForObjectDetection.from_pretrained("google/owlv2-large-patch14-ensemble").to(device)
+    processor = Owlv2Processor.from_pretrained(owlv2_source)
+    owlv2_model = Owlv2ForObjectDetection.from_pretrained(owlv2_source).to(device)
     owlv2_model.eval()
     texts = [["a photo of an animated character"]]
 
     vr = VideoReader(video_path, ctx=cpu(0))
     total_frames = len(vr)
     oom_shot_ids: List[int] = []
+
+    use_autocast = device == "cuda"
+    autocast_dtype = torch.bfloat16 if (use_autocast and torch.cuda.is_bf16_supported()) else torch.float16
 
     with open(tgrp_jsonl_path, "a", encoding="utf-8") as out_f:
         for shot in tqdm(pending_shots, desc="TGRP Per-Shot Tracking"):
@@ -272,22 +305,38 @@ def run_per_shot_tgrp(
                     for local_f_idx in key_frame_idx:
                         img_path = os.path.join(shot_dir, frame_names[local_f_idx])
                         image = Image.open(img_path).convert("RGB")
+                        img_w, img_h = image.size
+                        min_box_area = min_box_area_ratio * float(img_w * img_h)
+
                         inputs = processor(text=texts, images=image, return_tensors="pt")
                         inputs = {k: v.to(device) for k, v in inputs.items()}
-                        with torch.no_grad():
+                        with torch.inference_mode():
                             outputs = owlv2_model(**inputs)
 
                         target_sizes = torch.Tensor([image.size[::-1]])
                         detections = processor.post_process_object_detection(
                             outputs=outputs, threshold=0.1, target_sizes=target_sizes
                         )
-                        input_boxes = detections[0]["boxes"].cpu().numpy()
+                        input_boxes = detections[0]["boxes"].detach().cpu().numpy()
                         if input_boxes.shape[0] == 0:
                             continue
-                        bbox_scores = detections[0]["scores"].cpu().numpy()
+                        bbox_scores = detections[0]["scores"].detach().cpu().numpy()
+
+                        # Filter tiny noise detections before NMS
+                        valid_mask = np.array([box_area(b) >= min_box_area for b in input_boxes], dtype=bool)
+                        input_boxes = input_boxes[valid_mask]
+                        bbox_scores = bbox_scores[valid_mask]
+                        if input_boxes.shape[0] == 0:
+                            continue
+
                         selected_bboxes, selected_scores = non_max_suppression(
                             input_boxes, bbox_scores, iou_threshold=0.5
                         )
+                        # Cap to top-K highest scoring character boxes per seed frame so SAM 2.1 stays fast
+                        if len(selected_bboxes) > max_boxes_per_seed:
+                            selected_bboxes = selected_bboxes[:max_boxes_per_seed]
+                            selected_scores = selected_scores[:max_boxes_per_seed]
+
                         key_frame_detection_results[str(local_f_idx)] = {
                             "bbox": selected_bboxes,
                             "bbox_scores": selected_scores,
@@ -295,55 +344,56 @@ def run_per_shot_tgrp(
 
                     track_results_per_shot: Dict[str, Any] = {}
                     if key_frame_detection_results:
-                        inference_state = video_predictor.init_state(video_path=shot_dir)
+                        with torch.inference_mode(), torch.autocast(
+                            device_type="cuda" if use_autocast else "cpu",
+                            dtype=autocast_dtype,
+                            enabled=use_autocast,
+                        ):
+                            inference_state = video_predictor.init_state(video_path=shot_dir)
 
-                        for frame_idx_str, anns in key_frame_detection_results.items():
-                            ann_frame_idx = int(frame_idx_str)
-                            boxes = anns["bbox"]
-                            for obj_i, box in enumerate(boxes):
-                                video_predictor.add_new_points_or_box(
-                                    inference_state=inference_state,
-                                    frame_idx=ann_frame_idx,
-                                    obj_id=obj_i,
-                                    box=box,
-                                )
+                            for frame_idx_str, anns in key_frame_detection_results.items():
+                                ann_frame_idx = int(frame_idx_str)
+                                boxes = anns["bbox"]
+                                if not boxes:
+                                    continue
 
-                            video_segments_forward = {}
-                            for out_f_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
-                                inference_state
-                            ):
-                                video_segments_forward[out_f_idx] = {
-                                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                                    for i, out_obj_id in enumerate(out_obj_ids)
-                                }
+                                for obj_i, box in enumerate(boxes):
+                                    video_predictor.add_new_points_or_box(
+                                        inference_state=inference_state,
+                                        frame_idx=ann_frame_idx,
+                                        obj_id=obj_i,
+                                        box=box,
+                                    )
 
-                            video_segments_reverse = {}
-                            for out_f_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
-                                inference_state, reverse=True
-                            ):
-                                video_segments_reverse[out_f_idx] = {
-                                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                                    for i, out_obj_id in enumerate(out_obj_ids)
-                                }
+                                # Convert mask logits -> [x1, y1, x2, y2] immediately on GPU!
+                                # Never store full-res 2D boolean masks in CPU RAM.
+                                video_segments: Dict[int, Dict[int, List[int]]] = {}
+                                for out_f_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
+                                    inference_state
+                                ):
+                                    frame_boxes: Dict[int, List[int]] = {}
+                                    for i, out_obj_id in enumerate(out_obj_ids):
+                                        bbox = mask_logits_to_bbox_gpu(out_mask_logits[i])
+                                        if bbox is not None:
+                                            frame_boxes[int(out_obj_id)] = bbox
+                                    video_segments[int(out_f_idx)] = frame_boxes
 
-                            video_predictor.reset_state(inference_state)
-                            video_segments_all = merge_dicts(video_segments_forward, video_segments_reverse)
-
-                            video_segments = {}
-                            for idx, item in video_segments_all.items():
-                                new_item = {}
-                                for object_id, mask in item.items():
-                                    if not np.any(mask):
+                                for out_f_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
+                                    inference_state, reverse=True
+                                ):
+                                    if int(out_f_idx) in video_segments and video_segments[int(out_f_idx)]:
                                         continue
-                                    bbox = get_bounding_box_from_mask(mask)
-                                    if bbox is None or box_area(bbox) <= 0:
-                                        continue
-                                    new_item[object_id] = bbox
-                                video_segments[idx] = new_item
+                                    frame_boxes = {}
+                                    for i, out_obj_id in enumerate(out_obj_ids):
+                                        bbox = mask_logits_to_bbox_gpu(out_mask_logits[i])
+                                        if bbox is not None:
+                                            frame_boxes[int(out_obj_id)] = bbox
+                                    video_segments[int(out_f_idx)] = frame_boxes
 
-                            track_results_per_shot[frame_idx_str] = video_segments
+                                video_predictor.reset_state(inference_state)
+                                track_results_per_shot[frame_idx_str] = dict(sorted(video_segments.items()))
 
-                        track_results = merge_tracks(track_results_per_shot)
+                        track_results = merge_tracks(track_results_per_shot) if track_results_per_shot else []
                     else:
                         track_results = []
 
@@ -392,6 +442,8 @@ def classify_tracks_and_map_frames(
     from decord import VideoReader, cpu
     from torchvision import transforms
     from tqdm import tqdm
+
+    ensure_animated_ad_paths()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     character_bank = load_character_feature_bank(char_features_dir)
@@ -493,12 +545,11 @@ def classify_tracks_and_map_frames(
                 crop_tensors.append(transform(cropped_pil))
 
             batch_tensor = torch.stack(crop_tensors).to(device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 query_features = model(batch_tensor).clone().detach().cpu().numpy()
                 if query_features.ndim == 1:
                     query_features = query_features[None, :]
 
-            # Compute s_vm^p = max_j (1/3 * sum_{top-3, i} <f_j, z_i^p>)
             char_best_scores: Dict[str, float] = {}
             for q_feat in query_features:
                 for char_name, bank_feats in character_bank.items():
@@ -526,7 +577,6 @@ def classify_tracks_and_map_frames(
             classified_track["is_voice_anchor_valid"] = is_voice_valid
             classified_tracks.append(classified_track)
 
-            # Map shot-local frame indices back to global movie frame indices
             for local_f_str, bbox in frame_bbox_dict.items():
                 global_f_idx = shot_start_idx + int(local_f_str)
                 if 0 <= global_f_idx < total_frames:
@@ -612,7 +662,6 @@ def extract_adaptive_annotated_keyframes(
         scene_end_f = max(0, min(int(scene["end_frame"]), total_frames))
         scene_total_frames = max(1, scene_end_f - scene_start_f)
 
-        # 1. Aggregate recognized characters (s_vm > visual_prompt_thresh) across this scene
         char_max_score: Dict[str, float] = {}
         char_frame_counts: Dict[str, int] = defaultdict(int)
 
@@ -630,7 +679,6 @@ def extract_adaptive_annotated_keyframes(
             for label in seen_in_frame:
                 char_frame_counts[label] += 1
 
-        # Sort characters in scene by max_score descending so dominant characters get primary colors
         sorted_chars = sorted(
             char_max_score.keys(),
             key=lambda c: (char_frame_counts[c], char_max_score[c]),
@@ -655,7 +703,6 @@ def extract_adaptive_annotated_keyframes(
         scene["characters_present"] = characters_present_list
         scene_keyframes: List[Dict[str, Any]] = []
 
-        # 2. Adaptive per-shot keyframe selection
         for shot in scene.get("shot_ranges", []):
             shot_idx = int(shot["shot_idx"])
             s_frame = max(0, min(int(shot["start_frame"]), total_frames))
@@ -677,7 +724,6 @@ def extract_adaptive_annotated_keyframes(
                         intervals.append((int_s, int_e))
 
             for int_s, int_e in intervals:
-                # Prefer frames where recognized characters (s_vm > visual_prompt_thresh) are visible
                 frames_with_chars = [
                     f_i
                     for f_i in range(int_s, int_e)
@@ -688,7 +734,6 @@ def extract_adaptive_annotated_keyframes(
                 ]
                 candidate_pool = frames_with_chars if frames_with_chars else list(range(int_s, int_e))
 
-                # Subsample up to 16 candidate frames per 2s interval for fast Laplacian sharpness evaluation
                 if len(candidate_pool) > 16:
                     idxs = np.linspace(0, len(candidate_pool) - 1, 16, dtype=int)
                     candidate_pool = [candidate_pool[i] for i in idxs]
@@ -706,7 +751,6 @@ def extract_adaptive_annotated_keyframes(
                         best_frame_idx = int(cand_f_idx)
                         best_frame_rgb = cand_rgb
 
-                # Gather visible characters with s_vm > visual_prompt_thresh on best_frame_idx
                 pred = frames_predictions.get(str(best_frame_idx), {})
                 best_box_per_char: Dict[str, Tuple[float, List[int]]] = {}
                 for bbox, label, score in zip(
@@ -784,6 +828,7 @@ def run_stage3_visual_recog(
     mask_classify: bool = False,
     visual_prompt_thresh: float = 0.45,
     voice_harvest_thresh: float = 0.60,
+    max_boxes_per_seed: int = 8,
     restart: bool = False,
 ) -> Dict[str, Any]:
     """Run all 3 steps of Stage A3 and return summary statistics."""
@@ -805,6 +850,7 @@ def run_stage3_visual_recog(
         shots=shots,
         tgrp_jsonl_path=tgrp_jsonl_path,
         sam2_checkpoint=sam2_checkpoint,
+        max_boxes_per_seed=max_boxes_per_seed,
         restart=restart,
     )
 
@@ -880,6 +926,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Minimum DINOv2 similarity s_vm for Stage A4 voice anchor harvesting (default: 0.60)",
     )
+    parser.add_argument(
+        "--max_boxes_per_seed",
+        default=8,
+        type=int,
+        help="Maximum OWLv2 boxes propagated per seed frame (default: 8)",
+    )
     parser.add_argument("--restart", action="store_true", help="Discard existing tgrp_tracks.jsonl and restart TGRP")
     return parser.parse_args()
 
@@ -897,5 +949,6 @@ if __name__ == "__main__":
         mask_classify=args.mask_classify,
         visual_prompt_thresh=args.visual_prompt_thresh,
         voice_harvest_thresh=args.voice_harvest_thresh,
+        max_boxes_per_seed=args.max_boxes_per_seed,
         restart=args.restart,
     )

@@ -7,12 +7,10 @@
 2. Stages normalized `{Character}_{idx}.png` images into `output_dir/char_bank_staged/{movie_id}/`,
    ensuring `{Character}_0.png` is preserved as the profile anchor and every character has >=2
    samples for contrastive pair sampling.
-3. Optionally invokes `Animated_AD` web crawler + clustering if `--enable_crawler_fallback` is
-   enabled and a character has fewer than 5 exemplar images.
-4. Runs 75-epoch `DINOv2` (`dinov2_vitg14_reg` on L4 24GB or `dinov2_vitl14_reg` on T4 16GB)
+3. Runs 75-epoch `DINOv2` (`dinov2_vitg14_reg` on L4 24GB or `dinov2_vitl14_reg` on T4 16GB)
    contrastive fine-tuning (InfoNCE loss, tau=0.07, lr=6e-4 -> 5e-6) and saves
    `output_dir/checkpoints/{movie_id}/finetuned_dinov2_weights.pth`.
-5. Extracts character feature bank `.npz` files into `output_dir/char_features/{movie_id}/`
+4. Extracts character feature bank `.npz` files into `output_dir/char_features/{movie_id}/`
    using OWLv2 character detection + optional SAM 2.1 masking + fine-tuned DINOv2 embeddings,
    then flushes GPU VRAM.
 """
@@ -26,7 +24,6 @@ import os
 import random
 import re
 import shutil
-import subprocess
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -38,7 +35,7 @@ if TYPE_CHECKING:
 
 # Ensure project root and Animated_AD paths are importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pipeline import ANIMATED_AD_ROOT, ensure_animated_ad_paths
+from pipeline import ensure_animated_ad_paths, patch_owlv2_processor
 
 ensure_animated_ad_paths()
 
@@ -69,6 +66,49 @@ def rgba_to_rgb_white_bg(image: Image.Image, alpha_threshold: int = 100) -> Tupl
     return Image.fromarray(rgb_array), True
 
 
+def crop_character_image(
+    image: Image.Image,
+    bbox: List[float],
+    mask: Optional[np.ndarray] = None,
+    output_filename: Optional[str] = None,
+) -> Image.Image:
+    """Crop character region using bounding box and optional binary mask."""
+    import numpy as np
+    import PIL.Image as Image
+    from scipy.ndimage import binary_erosion, binary_fill_holes
+
+    x_min, y_min, x_max, y_max = map(int, bbox)
+    width, height = image.size
+    x_min = max(0, x_min)
+    y_min = max(0, y_min)
+    x_max = min(width, x_max)
+    y_max = min(height, y_max)
+    if x_max <= x_min or y_max <= y_min:
+        return image
+
+    if mask is None:
+        cropped_image = image.crop((x_min, y_min, x_max, y_max))
+    else:
+        np_image = np.array(image)
+        cropped_arr = np_image[y_min:y_max, x_min:x_max]
+        cropped_mask = mask[y_min:y_max, x_min:x_max]
+        white_background = np.full_like(cropped_arr, 255)
+
+        mask_bool = cropped_mask.astype(bool)
+        mask_bool = binary_erosion(mask_bool, iterations=2)
+        mask_bool = binary_fill_holes(mask_bool)
+
+        if cropped_arr.ndim == 3 and cropped_arr.shape[2] > 1:
+            mask_bool = mask_bool[..., None]
+
+        result_image = np.where(mask_bool, cropped_arr, white_background)
+        cropped_image = Image.fromarray(result_image.astype(np.uint8))
+
+    if output_filename is not None:
+        cropped_image.save(output_filename)
+    return cropped_image
+
+
 def prepare_staged_character_bank(
     movie_id: str,
     char_bank_dir: str,
@@ -83,7 +123,6 @@ def prepare_staged_character_bank(
 
     raw_images_dir = os.path.join(char_bank_dir, "raw_images")
     if not os.path.isdir(raw_images_dir):
-        # Fallback if images are placed directly inside char_bank_dir
         raw_images_dir = char_bank_dir
 
     if os.path.isdir(staged_movie_dir):
@@ -99,7 +138,6 @@ def prepare_staged_character_bank(
     ]
 
     if subdirs:
-        # Nested layout: raw_images/{Character}/{image_files}
         for char_name in subdirs:
             char_folder = os.path.join(raw_images_dir, char_name)
             img_files = [
@@ -109,7 +147,6 @@ def prepare_staged_character_bank(
             if not img_files:
                 continue
 
-            # Identify if an explicit _0 anchor exists; otherwise first sorted image becomes _0
             anchor_candidates = []
             other_candidates = []
             for f in img_files:
@@ -123,7 +160,6 @@ def prepare_staged_character_bank(
             for idx, src_path in enumerate(ordered_paths):
                 char_to_files[char_name].append((idx, src_path))
     else:
-        # Flat layout: raw_images/{Character}_{idx}.png
         for fname in entries:
             ext = os.path.splitext(fname)[1].lower()
             if ext not in IMAGE_EXTENSIONS:
@@ -145,7 +181,6 @@ def prepare_staged_character_bank(
         indexed_paths.sort(key=lambda x: x[0])
         staged_paths: List[str] = []
 
-        # Ensure index 0 exists as anchor
         for new_idx, (_, src_path) in enumerate(indexed_paths):
             dst_name = f"{char_name}_{new_idx}.png"
             dst_path = os.path.join(staged_movie_dir, dst_name)
@@ -153,7 +188,6 @@ def prepare_staged_character_bank(
                 img.save(dst_path, format="PNG")
             staged_paths.append(dst_path)
 
-        # Ensure at least 2 images per character so AnchorPlusPerLabelSampler never fails
         if len(staged_paths) == 1:
             dup_path = os.path.join(staged_movie_dir, f"{char_name}_1.png")
             shutil.copy2(staged_paths[0], dup_path)
@@ -161,7 +195,6 @@ def prepare_staged_character_bank(
 
         staged_manifest[char_name] = staged_paths
 
-    # Load or initialize character_glossary.json
     glossary_path = os.path.join(char_bank_dir, "character_glossary.json")
     glossary: Dict[str, str] = {}
     if os.path.isfile(glossary_path):
@@ -431,7 +464,8 @@ def extract_character_features(
     import torch
     from torchvision import transforms
     from tqdm import tqdm
-    from utils import crop_image
+
+    patch_owlv2_processor()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     transform = transforms.Compose(
@@ -461,9 +495,12 @@ def extract_character_features(
     if use_box:
         from transformers import Owlv2ForObjectDetection, Owlv2Processor
 
-        print("[Stage A2] Initializing OWLv2 for character bank box cropping...")
-        processor = Owlv2Processor.from_pretrained("google/owlv2-large-patch14-ensemble")
-        owlv2_model = Owlv2ForObjectDetection.from_pretrained("google/owlv2-large-patch14-ensemble").to(device)
+        owlv2_source = os.environ.get("OWLV2_MODEL_PATH", "google/owlv2-large-patch14-ensemble")
+        if not os.path.isdir(owlv2_source):
+            owlv2_source = "google/owlv2-large-patch14-ensemble"
+        print(f"[Stage A2] Initializing OWLv2 ({owlv2_source}) for character bank box cropping...")
+        processor = Owlv2Processor.from_pretrained(owlv2_source)
+        owlv2_model = Owlv2ForObjectDetection.from_pretrained(owlv2_source).to(device)
         owlv2_model.eval()
 
     model_archs = {
@@ -541,7 +578,7 @@ def extract_character_features(
                 )
                 instance_mask = np.squeeze(masks[0])
 
-            image = crop_image(image, bbox, instance_mask, None)
+            image = crop_character_image(image, bbox, instance_mask, None)
 
         image_tensor = transform(image).unsqueeze(0).to(device)
         with torch.no_grad():
@@ -583,7 +620,6 @@ def extract_character_features(
                 np.savez(os.path.join(char_features_dir, npz_name), feature=feats_np, character=char_name)
                 saved_counts[char_name] += 1
 
-    # Free all GPU models from VRAM
     del model, owlv2_model, processor, predictor
     gc.collect()
     if torch.cuda.is_available():
