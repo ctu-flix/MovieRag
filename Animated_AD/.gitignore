@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.mypy_cache/
+.pytest_cache/
+.vscode/
+logs/
+*.log
+build_character_bank/build_voice_bank/run.sh
+build_character_bank/feature_extraction/run.sh
+build_character_bank/feature_extraction/extract.sh
+character_recognition/logs
+
+# model weights: checkpoints/ holds the pretrained .pt and every fine-tune run
+checkpoints/
+*.pt
+*.pth
+
+# training run output
+wandb/
+work/
+outputs/
+filenames_*.pkl

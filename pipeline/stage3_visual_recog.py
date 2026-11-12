@@ -1,0 +1,901 @@
+#!/usr/bin/env python3
+"""Stage A3: Per-Shot Visual Tracking & Adaptive Annotated Keyframes (`stage3_visual_recog.py`).
+
+1. Step 3.1 (Per-Shot TGRP Tracking):
+   - Reads canonical `shots` from `shots_and_scenes.json` (where shots >20s are already subdivided).
+   - Decodes frames one shot at a time to a temporary folder to keep disk usage minimal.
+   - Samples 3 seed frames per shot, runs `google/owlv2-large-patch14-ensemble` (`threshold=0.1`,
+     NMS `iou_threshold=0.5`), prompts `SAM 2.1` (`sam2.1_hiera_l.yaml`) for bidirectional
+     mask propagation, and filters tracks via tripartite graph matching (>=2 seed sets, IoU >= 0.5).
+   - Appends each completed shot to `tgrp_tracks.jsonl` for crash-resumable execution and frees
+     `SAM 2.1` inference state after every shot.
+2. Step 3.2 (DINOv2 Track Classification & Global Frame Mapping):
+   - Samples up to 5 frames along each track, crops the character region, extracts features with
+     the fine-tuned `DINOv2` model from Stage A2, and computes top-3 average cosine similarity
+     $s_{\text{vm}}^p$ against each character in the bank.
+   - Retains labels with $s_{\text{vm}} > 0.45$ for visual prompting and marks $s_{\text{vm}} > 0.60$
+     for Stage A4 voice anchor harvesting.
+   - Writes `classified_tracks.json` and `visual_tracks_per_frame.json`.
+3. Step 3.3 (Adaptive Per-Shot Sharp Keyframe Extraction with Pre-Drawn Bounding Boxes):
+   - Short shots (<2.0s): selects 1 sharpest frame via OpenCV Variance of the Laplacian.
+   - Longer shots (>=2.0s): selects 1 sharpest frame per ~2.0s interval.
+   - Draws color-coded bounding boxes (`red`, `green`, `blue`, `yellow`, `pink`, `cyan`) for all
+     recognized characters ($s_{\text{vm}} > 0.45$) using a consistent per-scene color assignment.
+   - Saves annotated keyframes to `workdir/{movie_id}/keyframes/{scene_id}_shot{shot_idx}_{timestamp:06.2f}s.jpg`
+     and updates `shots_and_scenes.json` with `characters_present` and `keyframes`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import gc
+import json
+import os
+import random
+import re
+import sys
+import tempfile
+from collections import defaultdict
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    import numpy as np
+    import PIL.Image as Image
+
+# Ensure project root and Animated_AD paths are importable
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pipeline import ensure_animated_ad_paths
+
+ensure_animated_ad_paths()
+
+SCENE_COLOR_PALETTE: List[Tuple[str, List[int]]] = [
+    ("red", [255, 0, 0]),
+    ("green", [0, 255, 0]),
+    ("blue", [0, 0, 255]),
+    ("yellow", [255, 255, 0]),
+    ("pink", [255, 0, 255]),
+    ("cyan", [0, 255, 255]),
+]
+
+NPZ_NAME_RE = re.compile(r"^(?P<char>.+)_(?P<idx>\d+)\.npz$", re.IGNORECASE)
+
+
+def load_character_feature_bank(char_features_dir: str) -> Dict[str, np.ndarray]:
+    """Load character feature bank `.npz` files into `{char_name: np.ndarray(N, D)}`."""
+    import numpy as np
+
+    if not os.path.isdir(char_features_dir):
+        raise FileNotFoundError(f"Character feature bank directory does not exist: {char_features_dir}")
+
+    bank: Dict[str, List[np.ndarray]] = defaultdict(list)
+    for fname in sorted(os.listdir(char_features_dir)):
+        if not fname.lower().endswith(".npz"):
+            continue
+        fpath = os.path.join(char_features_dir, fname)
+        with np.load(fpath, allow_pickle=True) as archive:
+            feat = archive["feature"].copy()
+            if "character" in archive:
+                char_name = str(archive["character"])
+            else:
+                m = NPZ_NAME_RE.match(fname)
+                char_name = m.group("char") if m else os.path.splitext(fname)[0].split("_")[0]
+        if feat.ndim != 1:
+            feat = feat.reshape(-1)
+        bank[char_name].append(feat)
+
+    if not bank:
+        raise ValueError(f"No .npz character features found in {char_features_dir}")
+
+    return {char_name: np.stack(feats) for char_name, feats in bank.items()}
+
+
+def cosine_sim(vec1: np.ndarray, vec2: np.ndarray) -> float:
+    import numpy as np
+
+    denom = float(np.linalg.norm(vec1) * np.linalg.norm(vec2))
+    if denom == 0.0:
+        return 0.0
+    return float(np.dot(vec1, vec2) / denom)
+
+
+def convert_bbox_to_rectangle_mask(
+    bbox: List[float],
+    canvas_width: int,
+    canvas_height: int,
+    line_width: int = 6,
+) -> np.ndarray:
+    """Create binary rectangle outline mask matching Animated_AD's visual prompting style."""
+    import numpy as np
+
+    x0, y0, x1, y1 = bbox
+    delta_x = (x1 - x0) * 0.05
+    delta_y = (y1 - y0) * 0.05
+
+    x0_i = int(max(x0 - delta_x, 0))
+    y0_i = int(max(y0 - delta_y, 0))
+    x1_i = int(min(x1 + delta_x, canvas_width))
+    y1_i = int(min(y1 + delta_y, canvas_height))
+
+    lw = max(2, int(line_width))
+    canvas = np.zeros((canvas_height, canvas_width), dtype=np.float32)
+    if x1_i <= x0_i or y1_i <= y0_i:
+        return canvas
+
+    canvas[y0_i : min(y0_i + lw, canvas_height), x0_i:x1_i] = 1.0
+    canvas[max(0, y1_i - lw) : y1_i, x0_i:x1_i] = 1.0
+    canvas[y0_i:y1_i, x0_i : min(x0_i + lw, canvas_width)] = 1.0
+    canvas[y0_i:y1_i, max(0, x1_i - lw) : x1_i] = 1.0
+    return canvas
+
+
+def overlay_character_boxes_on_frame(
+    frame_rgb: np.ndarray,
+    char_boxes: List[Tuple[str, List[float], str, List[int]]],
+    label_width_ratio: float = 6.0,
+    label_alpha: float = 0.85,
+) -> np.ndarray:
+    """Draw color-coded bounding boxes onto an RGB frame array `(H, W, 3)`."""
+    import numpy as np
+
+    if not char_boxes:
+        return frame_rgb
+
+    h, w = frame_rgb.shape[:2]
+    line_width = max(2, int(round(label_width_ratio / 1000.0 * w)))
+
+    label_masks: Optional[np.ndarray] = None
+    total_masks: Optional[np.ndarray] = None
+
+    for _, bbox, _, rgb_color in char_boxes:
+        mask = convert_bbox_to_rectangle_mask(bbox, canvas_width=w, canvas_height=h, line_width=line_width)
+        color_arr = np.array(rgb_color, dtype=np.float32)[None, None, :]
+        if label_masks is None:
+            label_masks = mask[:, :, None] * color_arr
+            total_masks = mask
+        else:
+            label_masks = label_masks * (1.0 - mask[:, :, None]) + mask[:, :, None] * color_arr
+            total_masks = np.clip(total_masks + mask, 0.0, 1.0)
+
+    if total_masks is None or label_masks is None:
+        return frame_rgb
+
+    blended = (
+        frame_rgb.astype(np.float32) * (1.0 - total_masks[:, :, None] * label_alpha)
+        + total_masks[:, :, None] * label_alpha * label_masks
+    )
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+def run_per_shot_tgrp(
+    video_path: str,
+    movie_id: str,
+    shots: List[Dict[str, Any]],
+    tgrp_jsonl_path: str,
+    sam2_checkpoint: str,
+    restart: bool = False,
+) -> str:
+    """Run OWLv2 + SAM 2.1 bidirectional tracking + tripartite matching per shot with JSONL resume."""
+    import cv2
+    import numpy as np
+    import PIL.Image as Image
+    import torch
+    from decord import VideoReader, cpu
+    from tqdm import tqdm
+    from sam2.build_sam import build_sam2_video_predictor
+    from tgrp import (
+        box_area,
+        get_bounding_box_from_mask,
+        load_completed_shots,
+        merge_dicts,
+        merge_tracks,
+        non_max_suppression,
+        release_inference_state,
+    )
+    from transformers import Owlv2ForObjectDetection, Owlv2Processor
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    os.makedirs(os.path.dirname(os.path.abspath(tgrp_jsonl_path)), exist_ok=True)
+
+    if restart and os.path.exists(tgrp_jsonl_path):
+        os.remove(tgrp_jsonl_path)
+
+    completed_map = load_completed_shots(tgrp_jsonl_path)
+    done_shot_ids: Set[int] = completed_map.get(movie_id, set())
+
+    pending_shots = [s for s in shots if int(s["shot_idx"]) not in done_shot_ids]
+    if not pending_shots:
+        print(f"[Stage A3.1] All {len(shots)} shots already present in {tgrp_jsonl_path}; skipping TGRP.")
+        return tgrp_jsonl_path
+
+    if done_shot_ids:
+        print(f"[Stage A3.1] Resuming TGRP from {tgrp_jsonl_path}: {len(done_shot_ids)}/{len(shots)} shots done.")
+    else:
+        print(f"[Stage A3.1] Starting TGRP across {len(shots)} canonical shots...")
+
+    print("[Stage A3.1] Initializing SAM 2.1 VideoPredictor & OWLv2...")
+    model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
+    processor = Owlv2Processor.from_pretrained("google/owlv2-large-patch14-ensemble")
+    owlv2_model = Owlv2ForObjectDetection.from_pretrained("google/owlv2-large-patch14-ensemble").to(device)
+    owlv2_model.eval()
+    texts = [["a photo of an animated character"]]
+
+    vr = VideoReader(video_path, ctx=cpu(0))
+    total_frames = len(vr)
+    oom_shot_ids: List[int] = []
+
+    with open(tgrp_jsonl_path, "a", encoding="utf-8") as out_f:
+        for shot in tqdm(pending_shots, desc="TGRP Per-Shot Tracking"):
+            shot_id = int(shot["shot_idx"])
+            start_frame = max(0, min(int(shot["start_frame"]), total_frames))
+            end_frame = max(0, min(int(shot["end_frame"]), total_frames))
+            if start_frame >= end_frame:
+                continue
+
+            inference_state = None
+            with tempfile.TemporaryDirectory(prefix=f"tgrp_shot_{shot_id}_") as shot_dir:
+                try:
+                    frame_indices = list(range(start_frame, end_frame))
+                    frames_np = vr.get_batch(frame_indices).asnumpy()
+                    for global_f_idx, frame_rgb in zip(frame_indices, frames_np):
+                        frame_path = os.path.join(shot_dir, f"{global_f_idx}.jpg")
+                        cv2.imwrite(frame_path, frame_rgb[:, :, ::-1])
+
+                    frame_names = sorted(
+                        [p for p in os.listdir(shot_dir) if p.lower().endswith(".jpg")],
+                        key=lambda p: int(os.path.splitext(p)[0]),
+                    )
+                    n = len(frame_names)
+                    if n == 0:
+                        continue
+
+                    save_shot_results: Dict[str, Any] = {
+                        "video_idx": movie_id,
+                        "shot_idx": shot_id,
+                        "start_idx": int(frame_indices[0]),
+                        "end_idx": int(frame_indices[-1]),
+                    }
+
+                    rng = random.Random(f"{movie_id}:{shot_id}")
+                    if n < 3:
+                        key_frame_idx = rng.sample(range(n), n)
+                    else:
+                        division_size = n // 3
+                        key_frame_idx = [
+                            rng.choice(range(i * division_size, (i + 1) * division_size))
+                            for i in range(3)
+                        ]
+
+                    key_frame_detection_results: Dict[str, Any] = {}
+                    for local_f_idx in key_frame_idx:
+                        img_path = os.path.join(shot_dir, frame_names[local_f_idx])
+                        image = Image.open(img_path).convert("RGB")
+                        inputs = processor(text=texts, images=image, return_tensors="pt")
+                        inputs = {k: v.to(device) for k, v in inputs.items()}
+                        with torch.no_grad():
+                            outputs = owlv2_model(**inputs)
+
+                        target_sizes = torch.Tensor([image.size[::-1]])
+                        detections = processor.post_process_object_detection(
+                            outputs=outputs, threshold=0.1, target_sizes=target_sizes
+                        )
+                        input_boxes = detections[0]["boxes"].cpu().numpy()
+                        if input_boxes.shape[0] == 0:
+                            continue
+                        bbox_scores = detections[0]["scores"].cpu().numpy()
+                        selected_bboxes, selected_scores = non_max_suppression(
+                            input_boxes, bbox_scores, iou_threshold=0.5
+                        )
+                        key_frame_detection_results[str(local_f_idx)] = {
+                            "bbox": selected_bboxes,
+                            "bbox_scores": selected_scores,
+                        }
+
+                    track_results_per_shot: Dict[str, Any] = {}
+                    if key_frame_detection_results:
+                        inference_state = video_predictor.init_state(video_path=shot_dir)
+
+                        for frame_idx_str, anns in key_frame_detection_results.items():
+                            ann_frame_idx = int(frame_idx_str)
+                            boxes = anns["bbox"]
+                            for obj_i, box in enumerate(boxes):
+                                video_predictor.add_new_points_or_box(
+                                    inference_state=inference_state,
+                                    frame_idx=ann_frame_idx,
+                                    obj_id=obj_i,
+                                    box=box,
+                                )
+
+                            video_segments_forward = {}
+                            for out_f_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
+                                inference_state
+                            ):
+                                video_segments_forward[out_f_idx] = {
+                                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                                    for i, out_obj_id in enumerate(out_obj_ids)
+                                }
+
+                            video_segments_reverse = {}
+                            for out_f_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
+                                inference_state, reverse=True
+                            ):
+                                video_segments_reverse[out_f_idx] = {
+                                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                                    for i, out_obj_id in enumerate(out_obj_ids)
+                                }
+
+                            video_predictor.reset_state(inference_state)
+                            video_segments_all = merge_dicts(video_segments_forward, video_segments_reverse)
+
+                            video_segments = {}
+                            for idx, item in video_segments_all.items():
+                                new_item = {}
+                                for object_id, mask in item.items():
+                                    if not np.any(mask):
+                                        continue
+                                    bbox = get_bounding_box_from_mask(mask)
+                                    if bbox is None or box_area(bbox) <= 0:
+                                        continue
+                                    new_item[object_id] = bbox
+                                video_segments[idx] = new_item
+
+                            track_results_per_shot[frame_idx_str] = video_segments
+
+                        track_results = merge_tracks(track_results_per_shot)
+                    else:
+                        track_results = []
+
+                    save_shot_results["tracks"] = track_results
+                    out_f.write(json.dumps(save_shot_results) + "\n")
+                    out_f.flush()
+
+                except torch.cuda.OutOfMemoryError as exc:
+                    oom_shot_ids.append(shot_id)
+                    print(f"[Stage A3.1] WARNING: CUDA OOM on shot {shot_id} ({exc}); leaving for retry.")
+                finally:
+                    release_inference_state(video_predictor, inference_state)
+                    inference_state = None
+
+    del video_predictor, owlv2_model, processor, vr
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if oom_shot_ids:
+        print(f"[Stage A3.1] Skipped {len(oom_shot_ids)} shot(s) due to CUDA OOM: {oom_shot_ids}")
+    else:
+        print(f"[Stage A3.1] Completed TGRP tracking across all shots -> {tgrp_jsonl_path}")
+
+    return tgrp_jsonl_path
+
+
+def classify_tracks_and_map_frames(
+    video_path: str,
+    movie_id: str,
+    tgrp_jsonl_path: str,
+    ckpt_weights_path: str,
+    char_features_dir: str,
+    output_dir: str,
+    model_size: str = "giant",
+    use_mask: bool = False,
+    sam2_checkpoint: Optional[str] = None,
+    visual_prompt_thresh: float = 0.45,
+    voice_harvest_thresh: float = 0.60,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Classify TGRP tracks with fine-tuned DINOv2 and map to global movie frames."""
+    import numpy as np
+    import PIL.Image as Image
+    import torch
+    from classification import crop_object, load_jsonl
+    from decord import VideoReader, cpu
+    from torchvision import transforms
+    from tqdm import tqdm
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    character_bank = load_character_feature_bank(char_features_dir)
+    print(f"[Stage A3.2] Loaded character feature bank with {len(character_bank)} characters: {list(character_bank)}")
+
+    predictor = None
+    if use_mask:
+        if not sam2_checkpoint or not os.path.isfile(sam2_checkpoint):
+            raise FileNotFoundError(f"--sam2_checkpoint required when --mask_classify is enabled: {sam2_checkpoint}")
+        from sam2.build_sam import build_sam2
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+        sam2_model = build_sam2("configs/sam2.1/sam2.1_hiera_l.yaml", sam2_checkpoint, device=device)
+        predictor = SAM2ImagePredictor(sam2_model)
+
+    model_archs = {
+        "small": "vits14",
+        "base": "vitb14",
+        "large": "vitl14",
+        "giant": "vitg14",
+    }
+    model_name = f"dinov2_{model_archs[model_size]}_reg"
+    print(f"[Stage A3.2] Loading fine-tuned {model_name} weights from {ckpt_weights_path}...")
+    model = torch.hub.load(repo_or_dir="facebookresearch/dinov2", model=model_name, pretrained=False, verbose=False)
+    state_dict = torch.load(ckpt_weights_path, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
+    del state_dict
+    model.eval()
+    model.to(device)
+
+    transform = transforms.Compose(
+        [
+            transforms.Resize(256, interpolation=3),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        ]
+    )
+
+    unclassified_shots = load_jsonl(tgrp_jsonl_path)
+    unclassified_shots.sort(key=lambda r: int(r["shot_idx"]))
+
+    vr = VideoReader(video_path, ctx=cpu(0))
+    total_frames = len(vr)
+    fps = float(vr.get_avg_fps()) or 24.0
+
+    classified_shot_records: List[Dict[str, Any]] = []
+    frames_predictions: Dict[str, Dict[str, List[Any]]] = {}
+
+    total_tracks_count = 0
+    vp_valid_tracks_count = 0
+    voice_valid_tracks_count = 0
+
+    k = 5
+    for shot_record in tqdm(unclassified_shots, desc="DINOv2 Track Classification"):
+        shot_idx = int(shot_record["shot_idx"])
+        shot_start_idx = int(shot_record["start_idx"])
+        classified_tracks: List[Dict[str, Any]] = []
+
+        for unclassified_track in shot_record.get("tracks", []):
+            frame_bbox_dict: Dict[str, List[float]] = unclassified_track.get("track", {})
+            if not frame_bbox_dict:
+                continue
+
+            total_tracks_count += 1
+            frame_idx_ls = list(frame_bbox_dict.keys())
+            if k < len(frame_idx_ls):
+                rng = random.Random(f"{movie_id}:{shot_idx}:{unclassified_track.get('track_id', '')}")
+                selected_local_frames = rng.sample(frame_idx_ls, k)
+            else:
+                selected_local_frames = frame_idx_ls
+
+            valid_pairs: List[Tuple[str, int]] = []
+            for local_f_str in selected_local_frames:
+                global_f_idx = shot_start_idx + int(local_f_str)
+                if 0 <= global_f_idx < total_frames:
+                    valid_pairs.append((local_f_str, global_f_idx))
+
+            if not valid_pairs:
+                continue
+
+            decoded_frames = vr.get_batch([gf for _, gf in valid_pairs]).asnumpy()
+            crop_tensors = []
+
+            for (local_f_str, _), decoded_rgb in zip(valid_pairs, decoded_frames):
+                bbox = frame_bbox_dict[local_f_str]
+                pil_img = Image.fromarray(decoded_rgb).convert("RGB")
+                mask = None
+                if use_mask and predictor is not None:
+                    predictor.set_image(pil_img)
+                    masks, _, _ = predictor.predict(
+                        point_coords=None,
+                        point_labels=None,
+                        box=bbox,
+                        multimask_output=False,
+                    )
+                    mask = np.squeeze(masks[0])
+                cropped_pil = crop_object(np.array(pil_img), bbox, mask)
+                crop_tensors.append(transform(cropped_pil))
+
+            batch_tensor = torch.stack(crop_tensors).to(device)
+            with torch.no_grad():
+                query_features = model(batch_tensor).clone().detach().cpu().numpy()
+                if query_features.ndim == 1:
+                    query_features = query_features[None, :]
+
+            # Compute s_vm^p = max_j (1/3 * sum_{top-3, i} <f_j, z_i^p>)
+            char_best_scores: Dict[str, float] = {}
+            for q_feat in query_features:
+                for char_name, bank_feats in character_bank.items():
+                    sims = [cosine_sim(q_feat, b_feat) for b_feat in bank_feats]
+                    sims.sort(reverse=True)
+                    top_m = min(3, len(sims))
+                    score = sum(sims[:top_m]) / float(top_m)
+                    if char_name not in char_best_scores or score > char_best_scores[char_name]:
+                        char_best_scores[char_name] = score
+
+            best_char = max(char_best_scores.items(), key=lambda item: item[1])[0]
+            max_score = round(float(char_best_scores[best_char]), 4)
+            is_vp_valid = max_score > visual_prompt_thresh
+            is_voice_valid = max_score > voice_harvest_thresh
+
+            if is_vp_valid:
+                vp_valid_tracks_count += 1
+            if is_voice_valid:
+                voice_valid_tracks_count += 1
+
+            classified_track = copy.deepcopy(unclassified_track)
+            classified_track["label"] = best_char
+            classified_track["score"] = max_score
+            classified_track["is_visual_prompt_valid"] = is_vp_valid
+            classified_track["is_voice_anchor_valid"] = is_voice_valid
+            classified_tracks.append(classified_track)
+
+            # Map shot-local frame indices back to global movie frame indices
+            for local_f_str, bbox in frame_bbox_dict.items():
+                global_f_idx = shot_start_idx + int(local_f_str)
+                if 0 <= global_f_idx < total_frames:
+                    gf_key = str(global_f_idx)
+                    entry = frames_predictions.setdefault(
+                        gf_key, {"bbox_ls": [], "labels": [], "scores": []}
+                    )
+                    entry["bbox_ls"].append([int(round(c)) for c in bbox])
+                    entry["labels"].append(best_char)
+                    entry["scores"].append(max_score)
+
+        shot_out = copy.deepcopy(shot_record)
+        shot_out["movie_title"] = movie_id
+        shot_out["clip_idx"] = movie_id
+        shot_out["tracks"] = classified_tracks
+        classified_shot_records.append(shot_out)
+
+    del model, predictor, vr
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    os.makedirs(output_dir, exist_ok=True)
+    classified_tracks_path = os.path.join(output_dir, "classified_tracks.json")
+    with open(classified_tracks_path, "w", encoding="utf-8") as f:
+        json.dump(classified_shot_records, f, indent=2)
+
+    visual_tracks_payload: Dict[str, Any] = {
+        "movie_id": movie_id,
+        "total_frames": total_frames,
+        "fps": round(fps, 4),
+        "visual_prompt_thresh": visual_prompt_thresh,
+        "voice_harvest_thresh": voice_harvest_thresh,
+        "stats": {
+            "total_tracks": total_tracks_count,
+            "visual_prompt_tracks": vp_valid_tracks_count,
+            "voice_anchor_tracks": voice_valid_tracks_count,
+            "frames_with_detections": len(frames_predictions),
+        },
+        "frames": frames_predictions,
+    }
+    visual_tracks_path = os.path.join(output_dir, "visual_tracks_per_frame.json")
+    with open(visual_tracks_path, "w", encoding="utf-8") as f:
+        json.dump(visual_tracks_payload, f)
+
+    print(
+        f"[Stage A3.2] Classified {total_tracks_count} tracks "
+        f"({vp_valid_tracks_count} > {visual_prompt_thresh} for VLM prompting, "
+        f"{voice_valid_tracks_count} > {voice_harvest_thresh} for voice harvesting)."
+    )
+    print(f"[Stage A3.2] Saved frame-level visual tracks to: {visual_tracks_path}")
+
+    return classified_shot_records, visual_tracks_payload
+
+
+def extract_adaptive_annotated_keyframes(
+    video_path: str,
+    shots_and_scenes: Dict[str, Any],
+    frames_predictions: Dict[str, Dict[str, List[Any]]],
+    output_dir: str,
+    visual_prompt_thresh: float = 0.45,
+    short_shot_sec: float = 2.0,
+    interval_sec: float = 2.0,
+) -> Dict[str, Any]:
+    """Extract adaptive sharp per-shot keyframes and draw color-coded character bounding boxes."""
+    import cv2
+    import numpy as np
+    from decord import VideoReader, cpu
+    from tqdm import tqdm
+
+    vr = VideoReader(video_path, ctx=cpu(0))
+    total_frames = len(vr)
+    fps = float(shots_and_scenes.get("fps") or vr.get_avg_fps() or 24.0)
+
+    keyframes_dir = os.path.join(output_dir, "keyframes")
+    os.makedirs(keyframes_dir, exist_ok=True)
+
+    total_keyframes_saved = 0
+
+    for scene in tqdm(shots_and_scenes.get("scenes", []), desc="Adaptive Annotated Keyframes"):
+        scene_id = scene["scene_id"]
+        scene_start_f = max(0, min(int(scene["start_frame"]), total_frames))
+        scene_end_f = max(0, min(int(scene["end_frame"]), total_frames))
+        scene_total_frames = max(1, scene_end_f - scene_start_f)
+
+        # 1. Aggregate recognized characters (s_vm > visual_prompt_thresh) across this scene
+        char_max_score: Dict[str, float] = {}
+        char_frame_counts: Dict[str, int] = defaultdict(int)
+
+        for f_idx in range(scene_start_f, scene_end_f):
+            pred = frames_predictions.get(str(f_idx))
+            if not pred:
+                continue
+            seen_in_frame: Set[str] = set()
+            for label, score in zip(pred["labels"], pred["scores"]):
+                if float(score) <= visual_prompt_thresh:
+                    continue
+                if label not in char_max_score or float(score) > char_max_score[label]:
+                    char_max_score[label] = float(score)
+                seen_in_frame.add(label)
+            for label in seen_in_frame:
+                char_frame_counts[label] += 1
+
+        # Sort characters in scene by max_score descending so dominant characters get primary colors
+        sorted_chars = sorted(
+            char_max_score.keys(),
+            key=lambda c: (char_frame_counts[c], char_max_score[c]),
+            reverse=True,
+        )
+
+        char_to_color: Dict[str, Tuple[str, List[int]]] = {}
+        characters_present_list: List[Dict[str, Any]] = []
+
+        for idx, char_name in enumerate(sorted_chars):
+            color_name, rgb_val = SCENE_COLOR_PALETTE[idx % len(SCENE_COLOR_PALETTE)]
+            char_to_color[char_name] = (color_name, rgb_val)
+            characters_present_list.append(
+                {
+                    "name": char_name,
+                    "color_prompt": color_name,
+                    "max_score": round(char_max_score[char_name], 4),
+                    "screen_time_ratio": round(char_frame_counts[char_name] / float(scene_total_frames), 4),
+                }
+            )
+
+        scene["characters_present"] = characters_present_list
+        scene_keyframes: List[Dict[str, Any]] = []
+
+        # 2. Adaptive per-shot keyframe selection
+        for shot in scene.get("shot_ranges", []):
+            shot_idx = int(shot["shot_idx"])
+            s_frame = max(0, min(int(shot["start_frame"]), total_frames))
+            e_frame = max(0, min(int(shot["end_frame"]), total_frames))
+            if s_frame >= e_frame:
+                continue
+
+            shot_dur = (e_frame - s_frame) / fps
+            if shot_dur < short_shot_sec:
+                intervals = [(s_frame, e_frame)]
+            else:
+                num_intervals = max(1, int(round(shot_dur / interval_sec)))
+                step = (e_frame - s_frame) / float(num_intervals)
+                intervals = []
+                for i in range(num_intervals):
+                    int_s = int(round(s_frame + i * step))
+                    int_e = int(round(s_frame + (i + 1) * step)) if i < num_intervals - 1 else e_frame
+                    if int_s < int_e:
+                        intervals.append((int_s, int_e))
+
+            for int_s, int_e in intervals:
+                # Prefer frames where recognized characters (s_vm > visual_prompt_thresh) are visible
+                frames_with_chars = [
+                    f_i
+                    for f_i in range(int_s, int_e)
+                    if any(
+                        float(sc) > visual_prompt_thresh
+                        for sc in frames_predictions.get(str(f_i), {}).get("scores", [])
+                    )
+                ]
+                candidate_pool = frames_with_chars if frames_with_chars else list(range(int_s, int_e))
+
+                # Subsample up to 16 candidate frames per 2s interval for fast Laplacian sharpness evaluation
+                if len(candidate_pool) > 16:
+                    idxs = np.linspace(0, len(candidate_pool) - 1, 16, dtype=int)
+                    candidate_pool = [candidate_pool[i] for i in idxs]
+
+                decoded_candidates = vr.get_batch(candidate_pool).asnumpy()
+                best_frame_idx = candidate_pool[0]
+                best_frame_rgb = decoded_candidates[0]
+                best_sharpness = -1.0
+
+                for cand_f_idx, cand_rgb in zip(candidate_pool, decoded_candidates):
+                    gray = cv2.cvtColor(cand_rgb, cv2.COLOR_RGB2GRAY)
+                    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                    if sharpness > best_sharpness:
+                        best_sharpness = sharpness
+                        best_frame_idx = int(cand_f_idx)
+                        best_frame_rgb = cand_rgb
+
+                # Gather visible characters with s_vm > visual_prompt_thresh on best_frame_idx
+                pred = frames_predictions.get(str(best_frame_idx), {})
+                best_box_per_char: Dict[str, Tuple[float, List[int]]] = {}
+                for bbox, label, score in zip(
+                    pred.get("bbox_ls", []),
+                    pred.get("labels", []),
+                    pred.get("scores", []),
+                ):
+                    sc = float(score)
+                    if sc <= visual_prompt_thresh or label not in char_to_color:
+                        continue
+                    if label not in best_box_per_char or sc > best_box_per_char[label][0]:
+                        best_box_per_char[label] = (sc, [int(round(c)) for c in bbox])
+
+                boxes_to_draw: List[Tuple[str, List[float], str, List[int]]] = []
+                characters_visible_meta: List[Dict[str, Any]] = []
+
+                for char_name in sorted_chars:
+                    if char_name not in best_box_per_char:
+                        continue
+                    sc, bbox_int = best_box_per_char[char_name]
+                    color_name, rgb_val = char_to_color[char_name]
+                    boxes_to_draw.append((char_name, bbox_int, color_name, rgb_val))
+                    characters_visible_meta.append(
+                        {
+                            "name": char_name,
+                            "color": color_name,
+                            "bbox": bbox_int,
+                            "score": round(sc, 4),
+                        }
+                    )
+
+                annotated_rgb = overlay_character_boxes_on_frame(best_frame_rgb, boxes_to_draw)
+                timestamp_sec = round(best_frame_idx / fps, 2)
+                kf_filename = f"{scene_id}_shot{shot_idx}_{timestamp_sec:06.2f}s.jpg"
+                kf_rel_path = f"keyframes/{kf_filename}"
+                kf_abs_path = os.path.join(keyframes_dir, kf_filename)
+
+                cv2.imwrite(kf_abs_path, annotated_rgb[:, :, ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                total_keyframes_saved += 1
+
+                scene_keyframes.append(
+                    {
+                        "shot_idx": shot_idx,
+                        "frame_idx": best_frame_idx,
+                        "timestamp": timestamp_sec,
+                        "sharpness": round(best_sharpness, 2),
+                        "path": kf_rel_path,
+                        "characters_visible": characters_visible_meta,
+                    }
+                )
+
+        scene["keyframes"] = scene_keyframes
+
+    del vr
+    shots_and_scenes["total_keyframes"] = total_keyframes_saved
+    shots_path = os.path.join(output_dir, "shots_and_scenes.json")
+    with open(shots_path, "w", encoding="utf-8") as f:
+        json.dump(shots_and_scenes, f, indent=2)
+
+    print(
+        f"[Stage A3.3] Extracted & annotated {total_keyframes_saved} adaptive shot-keyframes "
+        f"into {keyframes_dir} and updated {shots_path}."
+    )
+    return shots_and_scenes
+
+
+def run_stage3_visual_recog(
+    video_path: str,
+    shots_file: str,
+    ckpt_weights: str,
+    char_features_dir: str,
+    sam2_checkpoint: str,
+    output_dir: str,
+    model_size: str = "giant",
+    mask_classify: bool = False,
+    visual_prompt_thresh: float = 0.45,
+    voice_harvest_thresh: float = 0.60,
+    restart: bool = False,
+) -> Dict[str, Any]:
+    """Run all 3 steps of Stage A3 and return summary statistics."""
+    if not os.path.isfile(shots_file):
+        raise FileNotFoundError(f"shots_and_scenes.json not found: {shots_file}")
+
+    with open(shots_file, "r", encoding="utf-8") as f:
+        shots_and_scenes = json.load(f)
+
+    movie_id = shots_and_scenes["movie_id"]
+    shots = shots_and_scenes["shots"]
+
+    tgrp_jsonl_path = os.path.join(output_dir, "tgrp_tracks.jsonl")
+
+    # Step 3.1: Per-shot TGRP
+    run_per_shot_tgrp(
+        video_path=video_path,
+        movie_id=movie_id,
+        shots=shots,
+        tgrp_jsonl_path=tgrp_jsonl_path,
+        sam2_checkpoint=sam2_checkpoint,
+        restart=restart,
+    )
+
+    # Step 3.2: DINOv2 Track Classification & Frame Mapping
+    _, visual_tracks_payload = classify_tracks_and_map_frames(
+        video_path=video_path,
+        movie_id=movie_id,
+        tgrp_jsonl_path=tgrp_jsonl_path,
+        ckpt_weights_path=ckpt_weights,
+        char_features_dir=char_features_dir,
+        output_dir=output_dir,
+        model_size=model_size,
+        use_mask=mask_classify,
+        sam2_checkpoint=sam2_checkpoint,
+        visual_prompt_thresh=visual_prompt_thresh,
+        voice_harvest_thresh=voice_harvest_thresh,
+    )
+
+    # Step 3.3: Adaptive Per-Shot Sharp Keyframes with Drawn Bounding Boxes
+    updated_scenes = extract_adaptive_annotated_keyframes(
+        video_path=video_path,
+        shots_and_scenes=shots_and_scenes,
+        frames_predictions=visual_tracks_payload["frames"],
+        output_dir=output_dir,
+        visual_prompt_thresh=visual_prompt_thresh,
+    )
+
+    return {
+        "movie_id": movie_id,
+        "num_shots": len(shots),
+        "num_scenes": len(updated_scenes.get("scenes", [])),
+        "total_keyframes": updated_scenes.get("total_keyframes", 0),
+        "track_stats": visual_tracks_payload["stats"],
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Stage A3: Per-shot TGRP tracking, DINOv2 classification, and adaptive annotated keyframes."
+    )
+    parser.add_argument("--video_path", required=True, type=str, help="Path to input movie video (.mp4/.mkv)")
+    parser.add_argument("--shots_file", required=True, type=str, help="Path to workdir/{movie_id}/shots_and_scenes.json")
+    parser.add_argument(
+        "--ckpt_weights",
+        required=True,
+        type=str,
+        help="Path to fine-tuned DINOv2 weights (finetuned_dinov2_weights.pth)",
+    )
+    parser.add_argument(
+        "--char_features_dir",
+        required=True,
+        type=str,
+        help="Path to extracted character features directory (char_features/{movie_id})",
+    )
+    parser.add_argument("--sam2_checkpoint", required=True, type=str, help="Path to SAM 2.1 checkpoint (.pt)")
+    parser.add_argument("--output_dir", required=True, type=str, help="Output workdir/{movie_id}")
+    parser.add_argument(
+        "--model_size",
+        default="giant",
+        choices=["small", "base", "large", "giant"],
+        help="DINOv2 model size (must match Stage A2)",
+    )
+    parser.add_argument("--mask_classify", action="store_true", help="Use SAM 2.1 masks when cropping tracks for DINOv2")
+    parser.add_argument(
+        "--visual_prompt_thresh",
+        default=0.45,
+        type=float,
+        help="Minimum DINOv2 similarity s_vm to draw character bounding box (default: 0.45)",
+    )
+    parser.add_argument(
+        "--voice_harvest_thresh",
+        default=0.60,
+        type=float,
+        help="Minimum DINOv2 similarity s_vm for Stage A4 voice anchor harvesting (default: 0.60)",
+    )
+    parser.add_argument("--restart", action="store_true", help="Discard existing tgrp_tracks.jsonl and restart TGRP")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    run_stage3_visual_recog(
+        video_path=args.video_path,
+        shots_file=args.shots_file,
+        ckpt_weights=args.ckpt_weights,
+        char_features_dir=args.char_features_dir,
+        sam2_checkpoint=args.sam2_checkpoint,
+        output_dir=args.output_dir,
+        model_size=args.model_size,
+        mask_classify=args.mask_classify,
+        visual_prompt_thresh=args.visual_prompt_thresh,
+        voice_harvest_thresh=args.voice_harvest_thresh,
+        restart=args.restart,
+    )
