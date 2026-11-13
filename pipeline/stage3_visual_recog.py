@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import ctypes
 import gc
@@ -38,11 +39,12 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Set, Tuple
 
 if TYPE_CHECKING:
     import numpy as np
@@ -103,6 +105,54 @@ def cosine_sim(vec1: np.ndarray, vec2: np.ndarray) -> float:
     if denom == 0.0:
         return 0.0
     return float(np.dot(vec1, vec2) / denom)
+
+
+def _trim_host_memory(empty_cuda: bool = False) -> None:
+    """Release Python GC objects, trim glibc C++ arenas, and optionally clear CUDA cache."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    if empty_cuda:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+@contextlib.contextmanager
+def _local_video_context(video_path: str) -> Iterator[str]:
+    """Copy Drive-backed videos to Colab Local SSD once to eliminate FUSE read/seek overhead."""
+    if not os.path.isfile(video_path):
+        yield video_path
+        return
+
+    abs_video = os.path.abspath(video_path)
+    if os.path.isdir("/content") and abs_video.startswith("/content/drive"):
+        scratch_dir = "/content/tgrp_scratch"
+        os.makedirs(scratch_dir, exist_ok=True)
+        local_copy = os.path.join(scratch_dir, f"local_{os.path.basename(abs_video)}")
+        src_size = os.path.getsize(abs_video)
+        if os.path.isfile(local_copy) and os.path.getsize(local_copy) == src_size:
+            yield local_copy
+            return
+
+        free_bytes = shutil.disk_usage("/content").free
+        if free_bytes > (src_size * 2 + 512 * 1024 * 1024):
+            print(
+                f"[Stage A3] Copying video ({src_size / (1024**2):.1f} MB) from Drive -> Local SSD "
+                f"for fast seek/decode: {local_copy}"
+            )
+            shutil.copy2(abs_video, local_copy)
+            try:
+                yield local_copy
+            finally:
+                if os.path.isfile(local_copy):
+                    os.remove(local_copy)
+            return
+
+    yield video_path
 
 
 def mask_logits_to_bbox_gpu(mask_logit_tensor: torch.Tensor) -> Optional[List[int]]:
@@ -208,7 +258,6 @@ def run_per_shot_tgrp(
     import numpy as np
     import PIL.Image as Image
     import torch
-    from decord import VideoReader, cpu
     from sam2.build_sam import build_sam2_video_predictor
     from tqdm import tqdm
     from tgrp import (
@@ -253,209 +302,208 @@ def run_per_shot_tgrp(
     owlv2_model.eval()
     texts = [["a photo of an animated character"]]
 
-    vr = VideoReader(video_path, ctx=cpu(0))
-    total_frames = len(vr)
-    oom_shot_ids: List[int] = []
+    with contextlib.ExitStack() as stack:
+        active_video_path = stack.enter_context(_local_video_context(video_path))
+        cap_probe = cv2.VideoCapture(active_video_path)
+        if not cap_probe.isOpened():
+            raise RuntimeError(f"Failed to open video for Stage A3.1: {active_video_path}")
+        total_frames = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap_probe.release()
+        _trim_host_memory()
 
-    use_autocast = device == "cuda"
-    autocast_dtype = torch.bfloat16 if (use_autocast and torch.cuda.is_bf16_supported()) else torch.float16
+        oom_shot_ids: List[int] = []
 
-    # Use a local disk scratch base outside RAM-backed /tmp if /content exists
-    scratch_base = "/content/tgrp_scratch" if os.path.isdir("/content") else None
-    if scratch_base:
-        os.makedirs(scratch_base, exist_ok=True)
+        use_autocast = device == "cuda"
+        autocast_dtype = torch.bfloat16 if (use_autocast and torch.cuda.is_bf16_supported()) else torch.float16
 
-    with open(tgrp_jsonl_path, "a", encoding="utf-8") as out_f:
-        for shot_counter, shot in enumerate(tqdm(pending_shots, desc="TGRP Per-Shot Tracking")):
-            shot_id = int(shot["shot_idx"])
-            start_frame = max(0, min(int(shot["start_frame"]), total_frames))
-            end_frame = max(0, min(int(shot["end_frame"]), total_frames))
-            if start_frame >= end_frame:
-                continue
+        # Use a local disk scratch base outside RAM-backed /tmp if /content exists
+        scratch_base = "/content/tgrp_scratch" if os.path.isdir("/content") else None
+        if scratch_base:
+            os.makedirs(scratch_base, exist_ok=True)
 
-            # Periodically re-create Decord VideoReader every 25 shots so C++ FFmpeg packet buffers never accumulate
-            if shot_counter > 0 and shot_counter % 25 == 0:
-                del vr
-                gc.collect()
-                vr = VideoReader(video_path, ctx=cpu(0))
+        with open(tgrp_jsonl_path, "a", encoding="utf-8") as out_f:
+            for shot in tqdm(pending_shots, desc="TGRP Per-Shot Tracking"):
+                shot_id = int(shot["shot_idx"])
+                start_frame = max(0, min(int(shot["start_frame"]), total_frames))
+                end_frame = max(0, min(int(shot["end_frame"]), total_frames))
+                if start_frame >= end_frame:
+                    continue
 
-            inference_state = None
-            with tempfile.TemporaryDirectory(prefix=f"tgrp_shot_{shot_id}_", dir=scratch_base) as shot_dir:
-                try:
-                    # Decode in small 32-frame chunks and free immediately so RAM stays flat
-                    for chunk_s in range(start_frame, end_frame, 32):
-                        chunk_e = min(chunk_s + 32, end_frame)
-                        chunk_indices = list(range(chunk_s, chunk_e))
-                        batch_np = vr.get_batch(chunk_indices).asnumpy()
-                        for global_f_idx, frame_rgb in zip(chunk_indices, batch_np):
-                            frame_path = os.path.join(shot_dir, f"{global_f_idx}.jpg")
-                            cv2.imwrite(frame_path, frame_rgb[:, :, ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                        del batch_np
+                inference_state = None
+                with tempfile.TemporaryDirectory(prefix=f"tgrp_shot_{shot_id}_", dir=scratch_base) as shot_dir:
+                    try:
+                        # Open & release cv2.VideoCapture per shot so FFmpeg buffers never accumulate (~26 GB leak in decord)
+                        cap = cv2.VideoCapture(active_video_path)
+                        if not cap.isOpened():
+                            raise RuntimeError(f"Failed to open video for shot {shot_id}: {active_video_path}")
+                        try:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                            for global_f_idx in range(start_frame, end_frame):
+                                ok, frame_bgr = cap.read()
+                                if not ok:
+                                    break
+                                frame_path = os.path.join(shot_dir, f"{global_f_idx}.jpg")
+                                cv2.imwrite(frame_path, frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                        finally:
+                            cap.release()
+                            _trim_host_memory()
 
-                    frame_names = sorted(
-                        [p for p in os.listdir(shot_dir) if p.lower().endswith(".jpg")],
-                        key=lambda p: int(os.path.splitext(p)[0]),
-                    )
-                    n = len(frame_names)
-                    if n == 0:
-                        continue
-
-                    save_shot_results: Dict[str, Any] = {
-                        "video_idx": movie_id,
-                        "shot_idx": shot_id,
-                        "start_idx": int(start_frame),
-                        "end_idx": int(end_frame - 1),
-                    }
-
-                    rng = random.Random(f"{movie_id}:{shot_id}")
-                    if n < 3:
-                        key_frame_idx = rng.sample(range(n), n)
-                    else:
-                        division_size = n // 3
-                        key_frame_idx = [
-                            rng.choice(range(i * division_size, (i + 1) * division_size))
-                            for i in range(3)
-                        ]
-
-                    key_frame_detection_results: Dict[str, Any] = {}
-                    for local_f_idx in key_frame_idx:
-                        img_path = os.path.join(shot_dir, frame_names[local_f_idx])
-                        image = Image.open(img_path).convert("RGB")
-                        img_w, img_h = image.size
-                        min_box_area = min_box_area_ratio * float(img_w * img_h)
-
-                        inputs = processor(text=texts, images=image, return_tensors="pt")
-                        inputs = {k: v.to(device) for k, v in inputs.items()}
-                        with torch.inference_mode():
-                            outputs = owlv2_model(**inputs)
-
-                        target_sizes = torch.Tensor([image.size[::-1]])
-                        detections = processor.post_process_object_detection(
-                            outputs=outputs, threshold=0.15, target_sizes=target_sizes
+                        frame_names = sorted(
+                            [p for p in os.listdir(shot_dir) if p.lower().endswith(".jpg")],
+                            key=lambda p: int(os.path.splitext(p)[0]),
                         )
-                        input_boxes = detections[0]["boxes"].detach().cpu().numpy()
-                        bbox_scores = detections[0]["scores"].detach().cpu().numpy()
+                        n = len(frame_names)
+                        if n == 0:
+                            continue
 
-                        # Fallback to threshold 0.10 only if nothing cleared 0.15
-                        if input_boxes.shape[0] == 0:
+                        save_shot_results: Dict[str, Any] = {
+                            "video_idx": movie_id,
+                            "shot_idx": shot_id,
+                            "start_idx": int(start_frame),
+                            "end_idx": int(end_frame - 1),
+                        }
+
+                        rng = random.Random(f"{movie_id}:{shot_id}")
+                        if n < 3:
+                            key_frame_idx = rng.sample(range(n), n)
+                        else:
+                            division_size = n // 3
+                            key_frame_idx = [
+                                rng.choice(range(i * division_size, (i + 1) * division_size))
+                                for i in range(3)
+                            ]
+
+                        key_frame_detection_results: Dict[str, Any] = {}
+                        for local_f_idx in key_frame_idx:
+                            img_path = os.path.join(shot_dir, frame_names[local_f_idx])
+                            image = Image.open(img_path).convert("RGB")
+                            img_w, img_h = image.size
+                            min_box_area = min_box_area_ratio * float(img_w * img_h)
+
+                            inputs = processor(text=texts, images=image, return_tensors="pt")
+                            inputs = {k: v.to(device) for k, v in inputs.items()}
+                            with torch.inference_mode():
+                                outputs = owlv2_model(**inputs)
+
+                            target_sizes = torch.Tensor([image.size[::-1]])
                             detections = processor.post_process_object_detection(
-                                outputs=outputs, threshold=0.10, target_sizes=target_sizes
+                                outputs=outputs, threshold=0.15, target_sizes=target_sizes
                             )
                             input_boxes = detections[0]["boxes"].detach().cpu().numpy()
                             bbox_scores = detections[0]["scores"].detach().cpu().numpy()
 
-                        del inputs, outputs, detections
-                        if input_boxes.shape[0] == 0:
-                            continue
+                            # Fallback to threshold 0.10 only if nothing cleared 0.15
+                            if input_boxes.shape[0] == 0:
+                                detections = processor.post_process_object_detection(
+                                    outputs=outputs, threshold=0.10, target_sizes=target_sizes
+                                )
+                                input_boxes = detections[0]["boxes"].detach().cpu().numpy()
+                                bbox_scores = detections[0]["scores"].detach().cpu().numpy()
 
-                        # Filter tiny noise detections before NMS
-                        valid_mask = np.array([box_area(b) >= min_box_area for b in input_boxes], dtype=bool)
-                        input_boxes = input_boxes[valid_mask]
-                        bbox_scores = bbox_scores[valid_mask]
-                        if input_boxes.shape[0] == 0:
-                            continue
+                            del inputs, outputs, detections
+                            if input_boxes.shape[0] == 0:
+                                continue
 
-                        selected_bboxes, selected_scores = non_max_suppression(
-                            input_boxes, bbox_scores, iou_threshold=0.5
-                        )
-                        # Cap to top-K highest scoring character boxes per seed frame
-                        if len(selected_bboxes) > max_boxes_per_seed:
-                            selected_bboxes = selected_bboxes[:max_boxes_per_seed]
-                            selected_scores = selected_scores[:max_boxes_per_seed]
+                            # Filter tiny noise detections before NMS
+                            valid_mask = np.array([box_area(b) >= min_box_area for b in input_boxes], dtype=bool)
+                            input_boxes = input_boxes[valid_mask]
+                            bbox_scores = bbox_scores[valid_mask]
+                            if input_boxes.shape[0] == 0:
+                                continue
 
-                        key_frame_detection_results[str(local_f_idx)] = {
-                            "bbox": selected_bboxes,
-                            "bbox_scores": selected_scores,
-                        }
-
-                    track_results_per_shot: Dict[str, Any] = {}
-                    if key_frame_detection_results:
-                        with torch.inference_mode(), torch.autocast(
-                            device_type="cuda" if use_autocast else "cpu",
-                            dtype=autocast_dtype,
-                            enabled=use_autocast,
-                        ):
-                            # offload_video_to_cpu=True + offload_state_to_cpu=False keeps VRAM low,
-                            # and we explicitly clear inference_state["images"] in finally!
-                            inference_state = video_predictor.init_state(
-                                video_path=shot_dir,
-                                offload_video_to_cpu=True,
+                            selected_bboxes, selected_scores = non_max_suppression(
+                                input_boxes, bbox_scores, iou_threshold=0.5
                             )
+                            # Cap to top-K highest scoring character boxes per seed frame
+                            if len(selected_bboxes) > max_boxes_per_seed:
+                                selected_bboxes = selected_bboxes[:max_boxes_per_seed]
+                                selected_scores = selected_scores[:max_boxes_per_seed]
 
-                            for frame_idx_str, anns in key_frame_detection_results.items():
-                                ann_frame_idx = int(frame_idx_str)
-                                boxes = anns["bbox"]
-                                if not boxes:
-                                    continue
+                            key_frame_detection_results[str(local_f_idx)] = {
+                                "bbox": selected_bboxes,
+                                "bbox_scores": selected_scores,
+                            }
 
-                                for obj_i, box in enumerate(boxes):
-                                    video_predictor.add_new_points_or_box(
-                                        inference_state=inference_state,
-                                        frame_idx=ann_frame_idx,
-                                        obj_id=obj_i,
-                                        box=box,
-                                    )
+                        track_results_per_shot: Dict[str, Any] = {}
+                        if key_frame_detection_results:
+                            with torch.inference_mode(), torch.autocast(
+                                device_type="cuda" if use_autocast else "cpu",
+                                dtype=autocast_dtype,
+                                enabled=use_autocast,
+                            ):
+                                # offload_video_to_cpu=True + offload_state_to_cpu=False keeps VRAM low,
+                                # and we explicitly clear inference_state["images"] + trim heap in finally!
+                                inference_state = video_predictor.init_state(
+                                    video_path=shot_dir,
+                                    offload_video_to_cpu=True,
+                                )
 
-                                # Convert mask logits -> [x1, y1, x2, y2] immediately on GPU!
-                                video_segments: Dict[int, Dict[int, List[int]]] = {}
-                                for out_f_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
-                                    inference_state
-                                ):
-                                    frame_boxes: Dict[int, List[int]] = {}
-                                    for i, out_obj_id in enumerate(out_obj_ids):
-                                        bbox = mask_logits_to_bbox_gpu(out_mask_logits[i])
-                                        if bbox is not None:
-                                            frame_boxes[int(out_obj_id)] = bbox
-                                    video_segments[int(out_f_idx)] = frame_boxes
-
-                                for out_f_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
-                                    inference_state, reverse=True
-                                ):
-                                    if int(out_f_idx) in video_segments and video_segments[int(out_f_idx)]:
+                                for frame_idx_str, anns in key_frame_detection_results.items():
+                                    ann_frame_idx = int(frame_idx_str)
+                                    boxes = anns["bbox"]
+                                    if not boxes:
                                         continue
-                                    frame_boxes = {}
-                                    for i, out_obj_id in enumerate(out_obj_ids):
-                                        bbox = mask_logits_to_bbox_gpu(out_mask_logits[i])
-                                        if bbox is not None:
-                                            frame_boxes[int(out_obj_id)] = bbox
-                                    video_segments[int(out_f_idx)] = frame_boxes
 
+                                    for obj_i, box in enumerate(boxes):
+                                        video_predictor.add_new_points_or_box(
+                                            inference_state=inference_state,
+                                            frame_idx=ann_frame_idx,
+                                            obj_id=obj_i,
+                                            box=box,
+                                        )
+
+                                    # Convert mask logits -> [x1, y1, x2, y2] immediately on GPU!
+                                    video_segments: Dict[int, Dict[int, List[int]]] = {}
+                                    for out_f_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
+                                        inference_state
+                                    ):
+                                        frame_boxes: Dict[int, List[int]] = {}
+                                        for i, out_obj_id in enumerate(out_obj_ids):
+                                            bbox = mask_logits_to_bbox_gpu(out_mask_logits[i])
+                                            if bbox is not None:
+                                                frame_boxes[int(out_obj_id)] = bbox
+                                        video_segments[int(out_f_idx)] = frame_boxes
+
+                                    for out_f_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
+                                        inference_state, reverse=True
+                                    ):
+                                        if int(out_f_idx) in video_segments and video_segments[int(out_f_idx)]:
+                                            continue
+                                        frame_boxes = {}
+                                        for i, out_obj_id in enumerate(out_obj_ids):
+                                            bbox = mask_logits_to_bbox_gpu(out_mask_logits[i])
+                                            if bbox is not None:
+                                                frame_boxes[int(out_obj_id)] = bbox
+                                        video_segments[int(out_f_idx)] = frame_boxes
+
+                                    video_predictor.reset_state(inference_state)
+                                    track_results_per_shot[frame_idx_str] = dict(sorted(video_segments.items()))
+
+                            track_results = merge_tracks(track_results_per_shot) if track_results_per_shot else []
+                        else:
+                            track_results = []
+
+                        save_shot_results["tracks"] = track_results
+                        out_f.write(json.dumps(save_shot_results) + "\n")
+                        out_f.flush()
+
+                    except torch.cuda.OutOfMemoryError as exc:
+                        oom_shot_ids.append(shot_id)
+                        print(f"[Stage A3.1] WARNING: CUDA OOM on shot {shot_id} ({exc}); leaving for retry.")
+                    finally:
+                        # Crucial: clear inference_state dict (including 'images' tensor) BEFORE gc.collect()!
+                        if inference_state is not None:
+                            try:
                                 video_predictor.reset_state(inference_state)
-                                track_results_per_shot[frame_idx_str] = dict(sorted(video_segments.items()))
+                            except Exception:
+                                pass
+                            if isinstance(inference_state, dict):
+                                inference_state.clear()
+                        inference_state = None
+                        _trim_host_memory(empty_cuda=True)
 
-                        track_results = merge_tracks(track_results_per_shot) if track_results_per_shot else []
-                    else:
-                        track_results = []
-
-                    save_shot_results["tracks"] = track_results
-                    out_f.write(json.dumps(save_shot_results) + "\n")
-                    out_f.flush()
-
-                except torch.cuda.OutOfMemoryError as exc:
-                    oom_shot_ids.append(shot_id)
-                    print(f"[Stage A3.1] WARNING: CUDA OOM on shot {shot_id} ({exc}); leaving for retry.")
-                finally:
-                    # Crucial: clear inference_state dict (including 'images' tensor) BEFORE gc.collect()!
-                    if inference_state is not None:
-                        try:
-                            video_predictor.reset_state(inference_state)
-                        except Exception:
-                            pass
-                        if isinstance(inference_state, dict):
-                            inference_state.clear()
-                    inference_state = None
-                    gc.collect()
-                    try:
-                        ctypes.CDLL("libc.so.6").malloc_trim(0)
-                    except Exception:
-                        pass
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
-    del video_predictor, owlv2_model, processor, vr
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    del video_predictor, owlv2_model, processor
+    _trim_host_memory(empty_cuda=True)
 
     if oom_shot_ids:
         print(f"[Stage A3.1] Skipped {len(oom_shot_ids)} shot(s) due to CUDA OOM: {oom_shot_ids}")
@@ -553,6 +601,11 @@ def classify_tracks_and_map_frames(
                 continue
 
             total_tracks_count += 1
+            if total_tracks_count > 1 and total_tracks_count % 20 == 0:
+                del vr
+                _trim_host_memory()
+                vr = VideoReader(video_path, ctx=cpu(0))
+
             frame_idx_ls = list(frame_bbox_dict.keys())
             if k < len(frame_idx_ls):
                 rng = random.Random(f"{movie_id}:{shot_idx}:{unclassified_track.get('track_id', '')}")
@@ -640,9 +693,7 @@ def classify_tracks_and_map_frames(
         classified_shot_records.append(shot_out)
 
     del model, predictor, vr
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _trim_host_memory(empty_cuda=True)
 
     os.makedirs(output_dir, exist_ok=True)
     classified_tracks_path = os.path.join(output_dir, "classified_tracks.json")
@@ -701,7 +752,11 @@ def extract_adaptive_annotated_keyframes(
 
     total_keyframes_saved = 0
 
-    for scene in tqdm(shots_and_scenes.get("scenes", []), desc="Adaptive Annotated Keyframes"):
+    for scene_counter, scene in enumerate(tqdm(shots_and_scenes.get("scenes", []), desc="Adaptive Annotated Keyframes")):
+        if scene_counter > 0 and scene_counter % 5 == 0:
+            del vr
+            _trim_host_memory()
+            vr = VideoReader(video_path, ctx=cpu(0))
         scene_id = scene["scene_id"]
         scene_start_f = max(0, min(int(scene["start_frame"]), total_frames))
         scene_end_f = max(0, min(int(scene["end_frame"]), total_frames))
@@ -851,6 +906,7 @@ def extract_adaptive_annotated_keyframes(
         scene["keyframes"] = scene_keyframes
 
     del vr
+    _trim_host_memory()
     shots_and_scenes["total_keyframes"] = total_keyframes_saved
     shots_path = os.path.join(output_dir, "shots_and_scenes.json")
     with open(shots_path, "w", encoding="utf-8") as f:
@@ -889,40 +945,41 @@ def run_stage3_visual_recog(
 
     tgrp_jsonl_path = os.path.join(output_dir, "tgrp_tracks.jsonl")
 
-    # Step 3.1: Per-shot TGRP
-    run_per_shot_tgrp(
-        video_path=video_path,
-        movie_id=movie_id,
-        shots=shots,
-        tgrp_jsonl_path=tgrp_jsonl_path,
-        sam2_checkpoint=sam2_checkpoint,
-        max_boxes_per_seed=max_boxes_per_seed,
-        restart=restart,
-    )
+    with _local_video_context(video_path) as active_video_path:
+        # Step 3.1: Per-shot TGRP
+        run_per_shot_tgrp(
+            video_path=active_video_path,
+            movie_id=movie_id,
+            shots=shots,
+            tgrp_jsonl_path=tgrp_jsonl_path,
+            sam2_checkpoint=sam2_checkpoint,
+            max_boxes_per_seed=max_boxes_per_seed,
+            restart=restart,
+        )
 
-    # Step 3.2: DINOv2 Track Classification & Frame Mapping
-    _, visual_tracks_payload = classify_tracks_and_map_frames(
-        video_path=video_path,
-        movie_id=movie_id,
-        tgrp_jsonl_path=tgrp_jsonl_path,
-        ckpt_weights_path=ckpt_weights,
-        char_features_dir=char_features_dir,
-        output_dir=output_dir,
-        model_size=model_size,
-        use_mask=mask_classify,
-        sam2_checkpoint=sam2_checkpoint,
-        visual_prompt_thresh=visual_prompt_thresh,
-        voice_harvest_thresh=voice_harvest_thresh,
-    )
+        # Step 3.2: DINOv2 Track Classification & Frame Mapping
+        _, visual_tracks_payload = classify_tracks_and_map_frames(
+            video_path=active_video_path,
+            movie_id=movie_id,
+            tgrp_jsonl_path=tgrp_jsonl_path,
+            ckpt_weights_path=ckpt_weights,
+            char_features_dir=char_features_dir,
+            output_dir=output_dir,
+            model_size=model_size,
+            use_mask=mask_classify,
+            sam2_checkpoint=sam2_checkpoint,
+            visual_prompt_thresh=visual_prompt_thresh,
+            voice_harvest_thresh=voice_harvest_thresh,
+        )
 
-    # Step 3.3: Adaptive Per-Shot Sharp Keyframes with Drawn Bounding Boxes
-    updated_scenes = extract_adaptive_annotated_keyframes(
-        video_path=video_path,
-        shots_and_scenes=shots_and_scenes,
-        frames_predictions=visual_tracks_payload["frames"],
-        output_dir=output_dir,
-        visual_prompt_thresh=visual_prompt_thresh,
-    )
+        # Step 3.3: Adaptive Per-Shot Sharp Keyframes with Drawn Bounding Boxes
+        updated_scenes = extract_adaptive_annotated_keyframes(
+            video_path=active_video_path,
+            shots_and_scenes=shots_and_scenes,
+            frames_predictions=visual_tracks_payload["frames"],
+            output_dir=output_dir,
+            visual_prompt_thresh=visual_prompt_thresh,
+        )
 
     return {
         "movie_id": movie_id,
