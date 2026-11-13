@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ctypes
 import gc
 import json
 import os
@@ -444,6 +445,10 @@ def run_per_shot_tgrp(
                             inference_state.clear()
                     inference_state = None
                     gc.collect()
+                    try:
+                        ctypes.CDLL("libc.so.6").malloc_trim(0)
+                    except Exception:
+                        pass
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
