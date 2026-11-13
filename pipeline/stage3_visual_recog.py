@@ -42,6 +42,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Set, Tuple
@@ -259,7 +260,6 @@ def run_per_shot_tgrp(
     import PIL.Image as Image
     import torch
     from sam2.build_sam import build_sam2_video_predictor
-    from tqdm import tqdm
     from tgrp import (
         box_area,
         load_completed_shots,
@@ -267,6 +267,34 @@ def run_per_shot_tgrp(
         non_max_suppression,
     )
     from transformers import Owlv2ForObjectDetection, Owlv2Processor
+
+    try:
+        import psutil
+
+        proc = psutil.Process(os.getpid())
+    except Exception:
+        proc = None
+
+    @contextlib.contextmanager
+    def _silence_sam2_tqdm() -> Iterator[None]:
+        prev_tqdm_disable = os.environ.get("TQDM_DISABLE")
+        os.environ["TQDM_DISABLE"] = "1"
+        patched: List[Tuple[Any, str, Any]] = []
+        noop_tqdm = lambda iterable=None, *a, **kw: iterable if iterable is not None else []
+        for mod_name in ("sam2.utils.misc", "sam2.sam2_video_predictor"):
+            mod = sys.modules.get(mod_name)
+            if mod is not None and hasattr(mod, "tqdm"):
+                patched.append((mod, "tqdm", getattr(mod, "tqdm")))
+                setattr(mod, "tqdm", noop_tqdm)
+        try:
+            yield
+        finally:
+            for mod, attr, orig in patched:
+                setattr(mod, attr, orig)
+            if prev_tqdm_disable is None:
+                os.environ.pop("TQDM_DISABLE", None)
+            else:
+                os.environ["TQDM_DISABLE"] = prev_tqdm_disable
 
     ensure_animated_ad_paths()
     patch_owlv2_processor()
@@ -303,6 +331,7 @@ def run_per_shot_tgrp(
     texts = [["a photo of an animated character"]]
 
     with contextlib.ExitStack() as stack:
+        stack.enter_context(_silence_sam2_tqdm())
         active_video_path = stack.enter_context(_local_video_context(video_path))
         cap_probe = cv2.VideoCapture(active_video_path)
         if not cap_probe.isOpened():
@@ -312,6 +341,7 @@ def run_per_shot_tgrp(
         _trim_host_memory()
 
         oom_shot_ids: List[int] = []
+        completed_count = len(done_shot_ids)
 
         use_autocast = device == "cuda"
         autocast_dtype = torch.bfloat16 if (use_autocast and torch.cuda.is_bf16_supported()) else torch.float16
@@ -322,13 +352,17 @@ def run_per_shot_tgrp(
             os.makedirs(scratch_base, exist_ok=True)
 
         with open(tgrp_jsonl_path, "a", encoding="utf-8") as out_f:
-            for shot in tqdm(pending_shots, desc="TGRP Per-Shot Tracking"):
+            for shot in pending_shots:
                 shot_id = int(shot["shot_idx"])
                 start_frame = max(0, min(int(shot["start_frame"]), total_frames))
                 end_frame = max(0, min(int(shot["end_frame"]), total_frames))
                 if start_frame >= end_frame:
                     continue
 
+                shot_t0 = time.perf_counter()
+                shot_frames_n = 0
+                shot_tracks_n = 0
+                shot_succeeded = False
                 inference_state = None
                 with tempfile.TemporaryDirectory(prefix=f"tgrp_shot_{shot_id}_", dir=scratch_base) as shot_dir:
                     try:
@@ -353,6 +387,7 @@ def run_per_shot_tgrp(
                             key=lambda p: int(os.path.splitext(p)[0]),
                         )
                         n = len(frame_names)
+                        shot_frames_n = n
                         if n == 0:
                             continue
 
@@ -486,6 +521,9 @@ def run_per_shot_tgrp(
                         save_shot_results["tracks"] = track_results
                         out_f.write(json.dumps(save_shot_results) + "\n")
                         out_f.flush()
+                        shot_tracks_n = len(track_results)
+                        shot_succeeded = True
+                        completed_count += 1
 
                     except torch.cuda.OutOfMemoryError as exc:
                         oom_shot_ids.append(shot_id)
@@ -501,6 +539,15 @@ def run_per_shot_tgrp(
                                 inference_state.clear()
                         inference_state = None
                         _trim_host_memory(empty_cuda=True)
+
+                if shot_succeeded:
+                    elapsed = time.perf_counter() - shot_t0
+                    ram_str = f"{proc.memory_info().rss / (1024 ** 3):.2f} GB" if proc is not None else "n/a"
+                    print(
+                        f"[Shot {shot_id:03d} ({completed_count}/{len(shots)})] "
+                        f"{shot_frames_n} frames | {shot_tracks_n} tracks | {elapsed:.1f}s | RAM: {ram_str}",
+                        flush=True,
+                    )
 
     del video_predictor, owlv2_model, processor
     _trim_host_memory(empty_cuda=True)
