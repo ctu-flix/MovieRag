@@ -80,7 +80,7 @@ def _format_mmss(seconds: float) -> str:
 
 def select_scene_keyframes(
     keyframes: List[Dict[str, Any]],
-    max_frames: int = 8,
+    max_frames: int = 15,
 ) -> List[Dict[str, Any]]:
     """Select <= max_frames keyframes preserving start/end anchors and character boxes."""
     if not keyframes:
@@ -224,13 +224,13 @@ def _load_external_plot_documents(
 
 
 def load_qwen25_vl(
-    model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+    model_id: str = "Qwen/Qwen3-VL-8B-Instruct",
     min_pixels: int = 256 * 28 * 28,
     max_pixels: int = 512 * 28 * 28,
 ):
-    """Load Qwen2.5-VL-7B-Instruct and its AutoProcessor with bounded visual token budget."""
+    """Load Qwen3-VL / Qwen2.5-VL and its AutoProcessor in native bfloat16 with bounded visual tokens."""
     import torch
-    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+    from transformers import AutoModelForImageTextToText, AutoProcessor
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else (torch.float16 if torch.cuda.is_available() else torch.float32)
@@ -239,7 +239,7 @@ def load_qwen25_vl(
         f"[Stage A5] Loading VLM '{model_id}' (dtype={dtype}, "
         f"min_pixels={min_pixels}, max_pixels={max_pixels})..."
     )
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model = AutoModelForImageTextToText.from_pretrained(
         model_id,
         torch_dtype=dtype,
         device_map="auto" if torch.cuda.is_available() else None,
@@ -338,13 +338,22 @@ def _format_color_legend_and_glossary(
     if char_colors:
         legend_items = [f"{name} ({color} box)" for name, color in char_colors.items()]
         legend_str = ", ".join(legend_items)
+    else:
+        legend_str = "None detected cleanly by automated visual tracker."
+
+    active_chars: List[str] = list(char_colors.keys())
+    for u in scene.get("subtitles", []):
+        spk = u.get("speaker")
+        if spk and spk in glossary and spk not in active_chars:
+            active_chars.append(spk)
+
+    if active_chars:
         glossary_lines = [
             f"- {name}: {glossary[name]}"
-            for name in char_colors
+            for name in active_chars
             if name in glossary
         ]
     else:
-        legend_str = "None detected cleanly by automated visual tracker."
         glossary_lines = [f"- {name}: {desc}" for name, desc in glossary.items()]
 
     glossary_str = "\n".join(glossary_lines) if glossary_lines else "- No glossary entries applicable."
@@ -400,7 +409,9 @@ def build_pass1_prompt(
         f"Recognized characters overlaid with colored bounding boxes: {legend_str}\n"
         f"CRITICAL RULE: Colored bounding boxes are provided strictly as character identity hints for you. "
         f"NEVER mention bounding boxes, box colors, rectangles, overlays, or 'Image 1/2' frame labels in your response.\n\n"
-        f"[Character Reference Glossary]\n{glossary_str}\n\n"
+        f"[Character Reference Glossary]\n{glossary_str}\n"
+        f"IMPORTANT: Use this glossary ONLY to recognize character identities. Do NOT copy clothing, hair, or "
+        f"weapon/prop descriptions from the glossary unless they are visibly worn or held in these frames.\n\n"
         f"[Previous Scene Continuity]\n"
         f"State entering this scene: {prev_exit_state or 'Opening sequence of the film.'}\n"
         f"Recent lines before this scene:\n{prev_subs_str}\n\n"
@@ -409,7 +420,7 @@ def build_pass1_prompt(
         f"Write ONE rich, cohesive, detailed narrative description (roughly 250-450 words) in present tense "
         f"describing what happens across these chronological frames in strictly accurate temporal order:\n"
         f"1. Setting & Atmosphere: Describe the exact location, lighting, weather, and props visible.\n"
-        f"2. Character Identification & Movements: Name recognized characters accurately (using their color hints) "
+        f"2. Character Identification & Movements: Name recognized characters accurately by their proper names "
         f"and describe any unrecognized characters/creatures objectively by appearance (without inventing names).\n"
         f"3. Actions & Chronology: Narrate step-by-step who does what across the scene, focusing on physical "
         f"movements, gestures, and spatial changes. {dialogue_guidance}\n"
@@ -455,7 +466,7 @@ def _caption_one_scene(
     glossary: Dict[str, str],
     prev_exit_state: str,
     prev_subtitles: List[Dict[str, Any]],
-    max_keyframes_per_scene: int = 8,
+    max_keyframes_per_scene: int = 15,
 ) -> Tuple[str, str, List[str]]:
     """Run Pass 1 (vlm_caption) and Pass 2 (exit_state) for a single Scene Window."""
     raw_kfs = scene.get("keyframes", [])
@@ -475,7 +486,7 @@ def _caption_one_scene(
         processor=processor,
         prompt_text=pass1_prompt,
         image_paths=kf_abs_paths,
-        max_new_tokens=512,
+        max_new_tokens=768,
     )
 
     last_kf_paths = [kf_abs_paths[-1]] if kf_abs_paths else []
@@ -496,14 +507,14 @@ def _caption_one_scene(
 
 
 def _gpu_vram_str() -> str:
-    """Format current CUDA allocated VRAM string cleanly."""
+    """Format current and peak CUDA allocated VRAM string cleanly."""
     try:
         import torch
 
         if torch.cuda.is_available():
             alloc = torch.cuda.memory_allocated() / (1024**3)
-            res = torch.cuda.memory_reserved() / (1024**3)
-            return f"{alloc:.2f} GB (Res {res:.2f})"
+            peak = torch.cuda.max_memory_allocated() / (1024**3)
+            return f"{alloc:.2f} GB (Peak {peak:.2f} GB)"
     except Exception:
         pass
     return "n/a"
@@ -526,8 +537,8 @@ def run_single_scene_diagnostic(
     scene_index: Optional[int] = 4,
     movie_title: str = "Sintel",
     char_bank_dir: Optional[str] = None,
-    vlm_model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
-    max_keyframes_per_scene: int = 8,
+    vlm_model_id: str = "Qwen/Qwen3-VL-8B-Instruct",
+    max_keyframes_per_scene: int = 15,
     min_pixels: int = 256 * 28 * 28,
     max_pixels: int = 512 * 28 * 28,
 ) -> Dict[str, Any]:
@@ -605,8 +616,8 @@ def run_stage5_vlm_caption(
     char_bank_dir: Optional[str] = None,
     glossary_file: Optional[str] = None,
     external_plot_file: Optional[str] = None,
-    vlm_model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
-    max_keyframes_per_scene: int = 8,
+    vlm_model_id: str = "Qwen/Qwen3-VL-8B-Instruct",
+    max_keyframes_per_scene: int = 15,
     min_pixels: int = 256 * 28 * 28,
     max_pixels: int = 512 * 28 * 28,
     restart: bool = False,
@@ -807,15 +818,15 @@ def run_stage5_vlm_caption(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stage A5: Two-Pass Qwen2.5-VL Scene Captioning")
+    parser = argparse.ArgumentParser(description="Stage A5: Two-Pass Qwen3-VL / Qwen2.5-VL Scene Captioning")
     parser.add_argument("--output_dir", required=True, help="Workdir containing shots_and_scenes.json")
     parser.add_argument("--movie_title", default=None, help="Display title for movie")
     parser.add_argument("--franchise_id", default=None, help="Franchise identifier")
     parser.add_argument("--char_bank_dir", default=None, help="Character bank directory")
     parser.add_argument("--glossary_file", default=None, help="Path to character_glossary.json")
     parser.add_argument("--external_plot_file", default=None, help="Optional Tier-3 plot file")
-    parser.add_argument("--vlm_model_id", default="Qwen/Qwen2.5-VL-7B-Instruct")
-    parser.add_argument("--max_keyframes_per_scene", type=int, default=8)
+    parser.add_argument("--vlm_model_id", default="Qwen/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--max_keyframes_per_scene", type=int, default=15)
     parser.add_argument("--restart", action="store_true", help="Ignore cached vlm_captions.jsonl")
     return parser.parse_args()
 
