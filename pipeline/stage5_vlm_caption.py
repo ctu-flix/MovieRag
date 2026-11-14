@@ -1,26 +1,30 @@
-"""Stage A5: Two-Pass Qwen2.5-VL-7B Scene Captioning & Knowledge Bundle Assembly.
+"""Stage A5: Single-Pass DeepSeek-Flash Vision API Scene Captioning & Knowledge Bundle Assembly.
 
 Implements Phase A Stage A5 for MovieRAG:
-1. Subsamples up to `max_keyframes_per_scene` (default 8) keyframes per Scene Window,
-   preserving temporal span (first & last frame) and prioritizing frames with
-   recognized character bounding boxes.
-2. Stages keyframes to fast local SSD (/content/vlm_scratch) in Colab to eliminate
-   Google Drive FUSE stalls.
-3. Runs Two-Pass inference with Qwen/Qwen2.5-VL-7B-Instruct (bfloat16 / fp16):
-   - Pass 1: Generates a rich 250-450 word character-grounded visual narrative
-     (`vlm_caption`) using annotated keyframes, color-to-character legend, static
-     glossary, speaker-attributed subtitles, and previous scene exit_state.
-   - Pass 2: Extracts a 2-3 sentence continuity state (`exit_state`) from Pass 1's
-     narrative and the final keyframe of the scene.
-4. Checkpoints every completed scene immediately to `vlm_captions.jsonl`, trims host
-   & GPU memory after every scene, and packages `movie_knowledge_bundle.json`.
+1. Selects up to `max_keyframes_per_scene` (default 15, i.e. 1 frame per 2s across a 15-30s
+   Scene Window) preserving start/end anchors and prioritizing character boxes.
+2. Stages keyframes to fast local SSD (/content/vlm_scratch) in Colab and downscales frames
+   in memory (default max_image_width=960) before Base64 JPEG encoding to cut image token
+   usage roughly in half without losing scene detail.
+3. Calls `deepseek-flash` via the OpenAI-compatible DeepSeek Vision API (`thinking={"type": "disabled"}`)
+   in a single structured pass per scene to generate both:
+   - `vlm_caption`: Detailed character-grounded chronological narrative (200-400 words).
+   - `exit_state`: Concise 2-3 sentence scene summary & continuity handoff for the next scene.
+4. Grounds each scene with the full Character Reference Glossary and the time-matched Act
+   synopsis from `external_plot.txt` so dark/silent scenes stay anchored to the true story
+   without leaking future spoilers.
+5. Checkpoints every completed scene immediately to `vlm_captions.jsonl` and packages
+   `movie_knowledge_bundle.json`.
 """
 
 import argparse
+import base64
 import ctypes
 import gc
+import io
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -30,25 +34,48 @@ from pipeline import PROJECT_ROOT
 
 
 SINTEL_FALLBACK_PLOT = (
-    "Sintel (2010) Full Plot Synopsis: A lone young warrior named Sintel searches a "
-    "snowy wasteland for her lost dragon companion, collapses after fighting a gatekeeper, "
-    "and awakens in the desert hut of an elderly Shaman. In a flashback to the city of "
-    "Ishtar, a younger Sintel rescues and bandages a baby red dragon she names Scales, "
-    "teaching him to fly until a giant adult dragon swoops down and snatches Scales away. "
-    "Determined to rescue him, Sintel journeys for years across mountains, forests, and "
-    "deserts before finding a mountain cavern containing a baby dragon beside a sleeping "
-    "giant Adult Dragon. When the Adult Dragon attacks Sintel, it pins her down and "
-    "suddenly hesitates upon looking into her eyes; Sintel seizes the moment and fatally "
-    "stabs it with her spear. As the giant dragon dies (~11:15), Sintel sees the healed "
-    "bandage scar on its wing and realizes in horror that many years had passed during "
-    "her quest, the giant Adult Dragon she killed was actually grown-up Scales, and the "
-    "small hatchling beside it is Scales's offspring. Grief-stricken, Sintel walks out "
-    "into the snow followed by the young dragon."
+    "Sintel (2010) — Full Plot & Ending Twist Synopsis:\n\n"
+    "Act I — The Snowstorm and the Shaman's Hut (00:00 - 03:35):\n"
+    "Sintel, a lone young woman warrior bundled in a fur-lined cloak and carrying a wooden staff, "
+    "wanders across a desolate, snow-swept mountain wilderness searching for someone. She is ambushed "
+    "by a masked gatekeeper warrior, whom she defeats after a tense close-quarters fight, claiming his "
+    "distinctive spear-blade before collapsing in the freezing storm. She awakens inside a warmly lit "
+    "desert hut tended by an elderly tribal Shaman with white dreadlocks, who offers her shelter and "
+    "asks what brings her to the land of the gatekeepers. Sintel reveals that she is searching the "
+    "world for a dragon companion who was taken from her.\n\n"
+    "Act II — Flashback in Ishtar and the Kidnapping of Scales (03:35 - 05:15):\n"
+    "In a flashback to Sintel's earlier life in the bustling sunlit city of Ishtar, she scavenges for "
+    "food and comes across a wounded, frightened baby red dragon with an injured wing. She brings the "
+    "hatchling back to her rooftop shelter, feeds him, wraps a makeshift bandage around his torn wing, "
+    "and names him Scales. Over time, Sintel and Scales form a deep affectionate bond as she heals him "
+    "and teaches him how to fly again. One day, as Scales soars above the rooftops of Ishtar, a giant "
+    "winged Adult Dragon descends out of the clouds, snatches Scales in its talons, and carries him "
+    "away into the sky despite Sintel's desperate chase.\n\n"
+    "Act III — The Long Quest and the Mountain Lair (05:15 - 10:15):\n"
+    "Vowing to bring Scales back, Sintel sets out on an arduous cross-continental quest across icy "
+    "mountain ridges, misty bamboo forests, and scorching dunes—growing visibly older and more weathered "
+    "over years of fruitless searching before collapsing in the desert and waking up in the Shaman's hut. "
+    "Encouraged by the Shaman's warning that some things cannot be found the way we expect, Sintel climbs "
+    "a jagged volcanic peak and enters a massive cavern lair. Deep inside the cave, she spots a giant "
+    "sleeping Adult Dragon curled beside a small baby red dragon. Hoping to rescue the young dragon "
+    "quietly, she creeps toward it.\n\n"
+    "Act IV — The Battle and the Wing-Scar Twist (10:15 - 14:48):\n"
+    "Before Sintel can escape with the hatchling, the giant Adult Dragon wakes up and attacks furiously "
+    "to protect the cavern. In the brutal clash, the Adult Dragon pins Sintel helplessly to the cavern "
+    "floor and prepares a fatal strike, but abruptly pauses as it stares closely into Sintel's eyes—"
+    "recognizing her and pulling back instead of killing her. Unaware of why the beast hesitated, Sintel "
+    "seizes the opening and drives her spear straight into the Adult Dragon's chest. As the giant dragon "
+    "collapses dying on the stone floor (~11:15), Sintel notices a familiar healed notch and torn "
+    "bandage-wrap scar along its wing—the exact wound she bound on Scales years ago. Realizing too late "
+    "that far more years had passed than she knew, the giant Adult Dragon she has just slain was actually "
+    "her grown-up Scales, and the little red dragon cowering nearby is Scales's own offspring. Shattered "
+    "by grief, Sintel drops her staff and walks blindly out into the falling snow while the orphaned baby "
+    "dragon quietly trails after her."
 )
 
 
 def _trim_host_memory(empty_cuda: bool = False) -> None:
-    """Release cyclic references, OS heap arenas, and optional CUDA cached blocks."""
+    """Release cyclic references and OS heap arenas."""
     gc.collect()
     try:
         libc = ctypes.CDLL("libc.so.6")
@@ -56,14 +83,6 @@ def _trim_host_memory(empty_cuda: bool = False) -> None:
             libc.malloc_trim(0)
     except Exception:
         pass
-    if empty_cuda:
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
 
 
 def _format_mmss(seconds: float) -> str:
@@ -76,6 +95,16 @@ def _format_mmss(seconds: float) -> str:
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:05.2f}"
     return f"{m:02d}:{s:05.2f}"
+
+
+def _parse_mmss_to_sec(mmss: str) -> float:
+    """Convert MM:SS or HH:MM:SS string to seconds."""
+    parts = [float(p) for p in mmss.strip().split(":")]
+    if len(parts) == 3:
+        return parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
+    if len(parts) == 2:
+        return parts[0] * 60.0 + parts[1]
+    return parts[0] if parts else 0.0
 
 
 def select_scene_keyframes(
@@ -149,6 +178,7 @@ def _load_character_glossary(
         candidates.append(glossary_file)
     if char_bank_dir:
         candidates.append(os.path.join(char_bank_dir, "character_glossary.json"))
+    candidates.append(str(PROJECT_ROOT / "char_bank" / os.path.basename(output_dir.rstrip("/")) / "character_glossary.json"))
 
     stage2_summary = os.path.join(output_dir, "stage2_charbank_summary.json")
     if os.path.isfile(stage2_summary):
@@ -175,7 +205,7 @@ def _load_external_plot_documents(
     char_bank_dir: Optional[str] = None,
     external_plot_file: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Load optional Tier-3 full-movie synopsis document for non-spoiler Phase B GraphRAG."""
+    """Load optional Tier-3 full-movie synopsis document for Phase B GraphRAG & Act grounding."""
     candidates: List[str] = []
     if external_plot_file:
         candidates.append(external_plot_file)
@@ -223,96 +253,95 @@ def _load_external_plot_documents(
     return []
 
 
-def load_qwen25_vl(
-    model_id: str = "Qwen/Qwen3-VL-8B-Instruct",
-    min_pixels: int = 256 * 28 * 28,
-    max_pixels: int = 512 * 28 * 28,
-):
-    """Load Qwen3-VL / Qwen2.5-VL and its AutoProcessor in native bfloat16 with bounded visual tokens."""
-    import torch
-    from transformers import AutoModelForImageTextToText, AutoProcessor
-
-    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    dtype = torch.bfloat16 if use_bf16 else (torch.float16 if torch.cuda.is_available() else torch.float32)
-
-    print(
-        f"[Stage A5] Loading VLM '{model_id}' (dtype={dtype}, "
-        f"min_pixels={min_pixels}, max_pixels={max_pixels})..."
-    )
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
-    model.eval()
-    processor = AutoProcessor.from_pretrained(
-        model_id,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
-    )
-    return model, processor
-
-
-def _generate_vlm_text(
-    model,
-    processor,
-    prompt_text: str,
-    image_paths: List[str],
-    max_new_tokens: int = 512,
+def _extract_time_matched_plot_context(
+    external_docs: List[Dict[str, Any]],
+    scene_start: float,
+    scene_end: float,
+    movie_id: str = "",
 ) -> str:
-    """Run a single multimodal Qwen2.5-VL generation pass and free image tensors cleanly."""
-    import torch
+    """Extract only the timestamped Act/Chapter paragraph(s) overlapping [scene_start, scene_end]."""
+    if movie_id.lower() == "sintel" and scene_start >= 744.0:
+        return (
+            "Closing Credits Sequence (12:24 - 14:48): Rolling end credits and production artwork/props "
+            "following the story's conclusion. Describe the visual credits/artwork concisely without "
+            "repeating sentences or inventing new plot actions."
+        )
+
+    if not external_docs:
+        return ""
+
+    full_text = "\n\n".join(str(d.get("content", "")) for d in external_docs if d.get("content"))
+    if not full_text.strip():
+        return ""
+
+    # Match paragraphs with (MM:SS - MM:SS) headers
+    pattern = re.compile(
+        r"([^\n]*\(\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*\)[^\n]*\n[^\n]+)",
+        re.MULTILINE,
+    )
+    matched_blocks: List[str] = []
+    for match in pattern.finditer(full_text):
+        block_text = match.group(1).strip()
+        act_start = _parse_mmss_to_sec(match.group(2))
+        act_end = _parse_mmss_to_sec(match.group(3))
+        if min(scene_end, act_end) > max(scene_start, act_start):
+            matched_blocks.append(block_text)
+
+    return "\n\n".join(matched_blocks)
+
+
+def resolve_deepseek_api_key(api_key: Optional[str] = None) -> str:
+    """Resolve DEEPSEEK_API_KEY from explicit parameter, environment variable, or Colab Secrets."""
+    if api_key and api_key.strip():
+        return api_key.strip()
+
+    env_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    try:
+        from google.colab import userdata  # type: ignore
+
+        colab_key = userdata.get("DEEPSEEK_API_KEY")
+        if colab_key and str(colab_key).strip():
+            return str(colab_key).strip()
+    except Exception:
+        pass
+
+    raise ValueError(
+        "Missing DEEPSEEK_API_KEY! Please add 'DEEPSEEK_API_KEY' in Google Colab Secrets "
+        "(key icon on the left sidebar -> enable Notebook access) or set os.environ['DEEPSEEK_API_KEY']."
+    )
+
+
+def create_deepseek_client(
+    api_key: Optional[str] = None,
+    api_base_url: str = "https://api.deepseek.com",
+):
+    """Create an OpenAI-compatible client configured for DeepSeek Vision API."""
+    from openai import OpenAI
+
+    resolved_key = resolve_deepseek_api_key(api_key)
+    return OpenAI(api_key=resolved_key, base_url=api_base_url)
+
+
+def _encode_image_data_uri(
+    image_path: str,
+    max_width: int = 960,
+    jpeg_quality: int = 85,
+) -> str:
+    """Load keyframe JPEG, downscale proportionally to <= max_width in memory, and return data URI."""
     from PIL import Image
 
-    pil_images: List[Image.Image] = []
-    content_items: List[Dict[str, Any]] = []
-    try:
-        for p in image_paths:
-            if not os.path.isfile(p):
-                continue
-            with Image.open(p) as im:
-                pil_images.append(im.convert("RGB"))
-            content_items.append({"type": "image"})
-
-        content_items.append({"type": "text", "text": prompt_text})
-        messages = [{"role": "user", "content": content_items}]
-
-        chat_prompt = processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        inputs = processor(
-            text=[chat_prompt],
-            images=pil_images if pil_images else None,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(model.device)
-
-        with torch.inference_mode():
-            generated_ids = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-            )
-
-        trimmed = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
-        ]
-        decoded = processor.batch_decode(
-            trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-        return (decoded[0] if decoded else "").strip()
-    finally:
-        for im in pil_images:
-            try:
-                im.close()
-            except Exception:
-                pass
-        pil_images.clear()
+    with Image.open(image_path) as im:
+        rgb = im.convert("RGB")
+        if max_width and rgb.width > max_width:
+            new_h = max(1, int(round(rgb.height * (max_width / float(rgb.width)))))
+            rgb = rgb.resize((max_width, new_h), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        rgb.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+        b64_data = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64_data}"
 
 
 def _format_color_legend_and_glossary(
@@ -320,7 +349,7 @@ def _format_color_legend_and_glossary(
     sampled_kfs: List[Dict[str, Any]],
     glossary: Dict[str, str],
 ) -> Tuple[str, str]:
-    """Build exact color-box legend and filtered character glossary text for Pass 1."""
+    """Build synthetic box legend and ALWAYS include the full character glossary."""
     char_colors: Dict[str, str] = {}
     for cp in scene.get("characters_present", []):
         name = cp.get("name")
@@ -336,45 +365,33 @@ def _format_color_legend_and_glossary(
                 char_colors[name] = color
 
     if char_colors:
-        legend_items = [f"{name} ({color} box)" for name, color in char_colors.items()]
+        legend_items = [f"{color} rectangle = {name}" for name, color in char_colors.items()]
         legend_str = ", ".join(legend_items)
     else:
-        legend_str = "None detected cleanly by automated visual tracker."
+        legend_str = "No synthetic tracking boxes drawn in this scene."
 
-    active_chars: List[str] = list(char_colors.keys())
-    for u in scene.get("subtitles", []):
-        spk = u.get("speaker")
-        if spk and spk in glossary and spk not in active_chars:
-            active_chars.append(spk)
-
-    if active_chars:
-        glossary_lines = [
-            f"- {name}: {glossary[name]}"
-            for name in active_chars
-            if name in glossary
-        ]
-    else:
-        glossary_lines = [f"- {name}: {desc}" for name, desc in glossary.items()]
-
+    # Always include ALL glossary characters so missed dark-scene detections never hide character traits
+    glossary_lines = [f"- {name}: {desc}" for name, desc in glossary.items()]
     glossary_str = "\n".join(glossary_lines) if glossary_lines else "- No glossary entries applicable."
     return legend_str, glossary_str
 
 
-def build_pass1_prompt(
+def build_single_pass_prompt(
     movie_title: str,
     scene: Dict[str, Any],
     sampled_kfs: List[Dict[str, Any]],
     glossary: Dict[str, str],
     prev_exit_state: str,
     prev_subtitles: List[Dict[str, Any]],
+    act_plot_context: str = "",
 ) -> str:
-    """Build the Pass-1 character-grounded scene captioning prompt."""
+    """Build the single-pass prompt returning both [SCENE_DESCRIPTION] and [EXIT_STATE]."""
     t0_str = _format_mmss(scene["start_time"])
     t1_str = _format_mmss(scene["end_time"])
     legend_str, glossary_str = _format_color_legend_and_glossary(scene, sampled_kfs, glossary)
 
     kf_timeline = ", ".join(
-        f"Image {idx + 1} ({_format_mmss(kf.get('timestamp', 0.0))}, shot {kf.get('shot_idx')})"
+        f"Frame {idx + 1} ({_format_mmss(kf.get('timestamp', 0.0))}, shot {kf.get('shot_idx')})"
         for idx, kf in enumerate(sampled_kfs)
     )
 
@@ -393,142 +410,247 @@ def build_pass1_prompt(
             f"{u.get('speaker', 'Unknown')}: \"{u['text']}\""
             for u in cur_subs
         )
-        dialogue_guidance = "Integrate what is being said cleanly alongside the physical actions and reactions."
+        dialogue_guidance = "Integrate what is being said naturally alongside the physical actions and reactions."
     else:
         cur_subs_str = "- [No spoken dialogue in this scene]"
         dialogue_guidance = (
-            "There is NO spoken dialogue in this scene. Focus thoroughly on silent visual storytelling: "
-            "movements, environment, objects, combat/actions, posture, and emotional facial expressions."
+            "There is NO spoken dialogue in this scene. Focus on silent visual storytelling: "
+            "movements, environment, objects, combat/actions, posture, and facial expressions."
+        )
+
+    act_block = ""
+    if act_plot_context:
+        act_block = (
+            f"[Time-Matched Act Reference (Broad Context Only)]\n"
+            f"{act_plot_context}\n"
+            f"IMPORTANT: Use this Act Reference ONLY to recognize characters, creatures, and the true "
+            f"narrative setting (especially in dark or wide shots). Describe ONLY the specific visual "
+            f"events occurring within [{t0_str} - {t1_str}] shown in these frames—do NOT narrate events "
+            f"from earlier or later in the Act.\n\n"
         )
 
     return (
-        f"You are analyzing a sequential scene from the animated film '{movie_title}'.\n"
-        f"Scene Window: [{t0_str} - {t1_str}] | Number of ordered keyframes shown: {len(sampled_kfs)}\n"
-        f"Frame Order: {kf_timeline}\n\n"
-        f"[Visual Prompt Legend]\n"
-        f"Recognized characters overlaid with colored bounding boxes: {legend_str}\n"
-        f"CRITICAL RULE: Colored bounding boxes are provided strictly as character identity hints for you. "
-        f"NEVER mention bounding boxes, box colors, rectangles, overlays, or 'Image 1/2' frame labels in your response.\n\n"
+        f"You are analyzing Scene {scene.get('scene_index', 0)} [{t0_str} - {t1_str}] from the animated film '{movie_title}'.\n"
+        f"Number of chronological keyframes attached: {len(sampled_kfs)}\n"
+        f"Keyframe Timeline: {kf_timeline}\n\n"
         f"[Character Reference Glossary]\n{glossary_str}\n"
-        f"IMPORTANT: Use this glossary ONLY to recognize character identities. Do NOT copy clothing, hair, or "
-        f"weapon/prop descriptions from the glossary unless they are visibly worn or held in these frames.\n\n"
+        f"IMPORTANT: Use this glossary to identify characters accurately and respect their canonical appearance "
+        f"(for example, Sintel has short dark-brown hair, NOT red hair; Shaman has white dreadlocks, no mask). "
+        f"Do NOT claim a character is holding a weapon or wearing gear from the glossary if it is not visible in these frames.\n\n"
+        f"[Synthetic Tracking Box Overlay Key]\n"
+        f"Overlay key: {legend_str}\n"
+        f"CRITICAL VISUAL RULE: Any colored rectangles drawn on the frames are synthetic computer-vision tracking overlays. "
+        f"NEVER mention bounding boxes, rectangles, box colors, or 'Frame 1/2' labels in your output, and NEVER confuse "
+        f"a red/green/blue tracking box with hair color, clothing color, or glowing objects.\n\n"
+        f"{act_block}"
         f"[Previous Scene Continuity]\n"
         f"State entering this scene: {prev_exit_state or 'Opening sequence of the film.'}\n"
         f"Recent lines before this scene:\n{prev_subs_str}\n\n"
         f"[Spoken Dialogue in This Scene]\n{cur_subs_str}\n\n"
         f"[Task]\n"
-        f"Write ONE rich, cohesive, detailed narrative description (roughly 250-450 words) in present tense "
-        f"describing what happens across these chronological frames in strictly accurate temporal order:\n"
-        f"1. Setting & Atmosphere: Describe the exact location, lighting, weather, and props visible.\n"
-        f"2. Character Identification & Movements: Name recognized characters accurately by their proper names "
-        f"and describe any unrecognized characters/creatures objectively by appearance (without inventing names).\n"
-        f"3. Actions & Chronology: Narrate step-by-step who does what across the scene, focusing on physical "
-        f"movements, gestures, and spatial changes. {dialogue_guidance}\n"
-        f"4. Interactions & Facial Expressions: Describe eye contact, interpersonal reactions, and emotions.\n"
-        f"STRICT SPOILER RULE: Describe ONLY what is directly shown in this scene's frames and dialogue. "
-        f"Do NOT extrapolate or reveal future plot events or hidden twists."
+        f"Respond using EXACTLY the two section headers below:\n\n"
+        f"[SCENE_DESCRIPTION]\n"
+        f"Write ONE rich, cohesive, detailed narrative description (180-350 words, scaling naturally with the amount "
+        f"of action—stop immediately once the final frame is described and NEVER repeat sentences) in present tense:\n"
+        f"1. Setting & Atmosphere: Describe the location, lighting, weather, and props actually visible.\n"
+        f"2. Character Identification & Movements: Name recognized characters by their proper names and describe any "
+        f"unrecognized characters/creatures accurately (e.g., masked gatekeeper warrior, giant Adult Dragon).\n"
+        f"3. Actions & Chronology: Narrate step-by-step who does what across the frames. {dialogue_guidance}\n"
+        f"4. Interactions & Expressions: Describe eye contact, physical condition, and emotional reactions.\n\n"
+        f"[EXIT_STATE]\n"
+        f"Write a concise 2-3 sentence summary of what happened in this scene and the exact state at the end of the "
+        f"scene (character positions, held objects, physical/emotional state, and immediate unresolved tension) to serve "
+        f"as the continuity handoff into the next scene."
     )
 
 
-def build_pass2_prompt(
-    movie_title: str,
-    scene: Dict[str, Any],
-    vlm_caption: str,
-) -> str:
-    """Build the Pass-2 exit-state extraction prompt."""
-    t0_str = _format_mmss(scene["start_time"])
-    t1_str = _format_mmss(scene["end_time"])
-    cur_subs = scene.get("subtitles", [])[-3:]
-    subs_str = (
-        "\n".join(f"- {u.get('speaker', 'Unknown')}: \"{u['text']}\"" for u in cur_subs)
-        if cur_subs
-        else "- (No spoken dialogue)"
+def _parse_scene_and_exit_state(raw_text: str) -> Tuple[str, str]:
+    """Parse [SCENE_DESCRIPTION] and [EXIT_STATE] sections cleanly from model output."""
+    text = (raw_text or "").strip()
+    if not text:
+        return "", ""
+
+    # Handle optional JSON output if model ever wraps response in JSON
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and ("vlm_caption" in data or "scene_description" in data):
+                cap = str(data.get("vlm_caption") or data.get("scene_description") or "").strip()
+                ex = str(data.get("exit_state") or "").strip()
+                return cap, ex
+        except Exception:
+            pass
+
+    split_match = re.split(
+        r"(?:\n|^)\s*(?:\*\*|#*\s*)?\[?EXIT_STATE\]?(?:\*\*|:)?\s*\n?",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
     )
-    return (
-        f"You have just viewed the final frame of Scene {scene.get('scene_index', 0)} [{t0_str} - {t1_str}] "
-        f"of '{movie_title}'.\n\n"
-        f"[Scene Narrative]\n{vlm_caption}\n\n"
-        f"[Final Spoken Lines]\n{subs_str}\n\n"
-        f"[Task]\n"
-        f"Write a concise 2-3 sentence EXIT STATE summarizing the exact continuity status at the end of this scene "
-        f"so the next scene understands the handoff: where key characters are positioned, what objects they hold, "
-        f"their emotional/physical condition, and any immediate unresolved action. Do not mention bounding boxes or "
-        f"the phrase 'final frame'."
-    )
+    if len(split_match) == 2:
+        desc_part, exit_part = split_match[0].strip(), split_match[1].strip()
+    else:
+        desc_part, exit_part = text, ""
+
+    desc_part = re.sub(
+        r"^\s*(?:\*\*|#*\s*)?\[?SCENE_DESCRIPTION\]?(?:\*\*|:)?\s*\n?",
+        "",
+        desc_part,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    if not exit_part and desc_part:
+        sentences = re.split(r"(?<=[.!?])\s+", desc_part)
+        exit_part = " ".join(sentences[-2:]).strip() if len(sentences) >= 2 else desc_part
+
+    return desc_part, exit_part
+
+
+def _call_deepseek_vision(
+    client,
+    model_id: str,
+    prompt_text: str,
+    image_paths: List[str],
+    max_image_width: int = 960,
+    max_new_tokens: int = 1000,
+    max_retries: int = 3,
+) -> Tuple[str, Dict[str, int]]:
+    """Send keyframes + prompt to deepseek-flash with thinking disabled and return text + token usage."""
+    content_items: List[Dict[str, Any]] = []
+    for p in image_paths:
+        if not os.path.isfile(p):
+            continue
+        data_uri = _encode_image_data_uri(p, max_width=max_image_width)
+        content_items.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": data_uri},
+            }
+        )
+    content_items.append({"type": "text", "text": prompt_text})
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert film analyst for a multimodal video retrieval system. "
+                "Follow all formatting constraints strictly, never repeat sentences, and never "
+                "mention synthetic computer-vision bounding boxes."
+            ),
+        },
+        {"role": "user", "content": content_items},
+    ]
+
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                max_tokens=max_new_tokens,
+                temperature=0.2,
+                frequency_penalty=0.2,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+            out_text = (response.choices[0].message.content or "").strip()
+            usage_obj = getattr(response, "usage", None)
+            usage = {
+                "prompt_tokens": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
+            }
+            return out_text, usage
+        except Exception as exc:
+            last_err = exc
+            # Fallback if endpoint rejects frequency_penalty
+            if "frequency_penalty" in str(exc) and attempt == 1:
+                try:
+                    response = client.chat.completions.create(
+                        model=model_id,
+                        messages=messages,
+                        max_tokens=max_new_tokens,
+                        temperature=0.2,
+                        extra_body={"thinking": {"type": "disabled"}},
+                    )
+                    out_text = (response.choices[0].message.content or "").strip()
+                    usage_obj = getattr(response, "usage", None)
+                    usage = {
+                        "prompt_tokens": int(getattr(usage_obj, "prompt_tokens", 0) or 0),
+                        "completion_tokens": int(getattr(usage_obj, "completion_tokens", 0) or 0),
+                        "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
+                    }
+                    return out_text, usage
+                except Exception as inner_exc:
+                    last_err = inner_exc
+            if attempt < max_retries:
+                wait_s = 2.0 * attempt
+                print(f"[Stage A5] API attempt {attempt}/{max_retries} failed ({last_err}); retrying in {wait_s:.0f}s...")
+                time.sleep(wait_s)
+
+    raise RuntimeError(f"DeepSeek Vision API call failed after {max_retries} attempts: {last_err}")
 
 
 def _caption_one_scene(
-    model,
-    processor,
+    client,
+    vlm_model_id: str,
+    movie_id: str,
     movie_title: str,
     scene: Dict[str, Any],
     resolve_kf_path: Callable[[str], str],
     glossary: Dict[str, str],
+    external_docs: List[Dict[str, Any]],
     prev_exit_state: str,
     prev_subtitles: List[Dict[str, Any]],
     max_keyframes_per_scene: int = 15,
-) -> Tuple[str, str, List[str]]:
-    """Run Pass 1 (vlm_caption) and Pass 2 (exit_state) for a single Scene Window."""
+    max_image_width: int = 960,
+) -> Tuple[str, str, List[str], Dict[str, int]]:
+    """Run single-pass DeepSeek Vision API call for a Scene Window."""
     raw_kfs = scene.get("keyframes", [])
     sampled_kfs = select_scene_keyframes(raw_kfs, max_frames=max_keyframes_per_scene)
     kf_abs_paths = [resolve_kf_path(kf["path"]) for kf in sampled_kfs]
 
-    pass1_prompt = build_pass1_prompt(
+    act_context = _extract_time_matched_plot_context(
+        external_docs=external_docs,
+        scene_start=float(scene["start_time"]),
+        scene_end=float(scene["end_time"]),
+        movie_id=movie_id,
+    )
+    prompt_text = build_single_pass_prompt(
         movie_title=movie_title,
         scene=scene,
         sampled_kfs=sampled_kfs,
         glossary=glossary,
         prev_exit_state=prev_exit_state,
         prev_subtitles=prev_subtitles,
+        act_plot_context=act_context,
     )
-    vlm_caption = _generate_vlm_text(
-        model=model,
-        processor=processor,
-        prompt_text=pass1_prompt,
+    raw_output, usage = _call_deepseek_vision(
+        client=client,
+        model_id=vlm_model_id,
+        prompt_text=prompt_text,
         image_paths=kf_abs_paths,
-        max_new_tokens=768,
+        max_image_width=max_image_width,
+        max_new_tokens=1000,
     )
-
-    last_kf_paths = [kf_abs_paths[-1]] if kf_abs_paths else []
-    pass2_prompt = build_pass2_prompt(
-        movie_title=movie_title,
-        scene=scene,
-        vlm_caption=vlm_caption,
-    )
-    exit_state = _generate_vlm_text(
-        model=model,
-        processor=processor,
-        prompt_text=pass2_prompt,
-        image_paths=last_kf_paths,
-        max_new_tokens=160,
-    )
-
-    return vlm_caption, exit_state, [kf["path"] for kf in sampled_kfs]
+    vlm_caption, exit_state = _parse_scene_and_exit_state(raw_output)
+    return vlm_caption, exit_state, [kf["path"] for kf in sampled_kfs], usage
 
 
-def _gpu_vram_str() -> str:
-    """Format current and peak CUDA allocated VRAM string cleanly."""
-    try:
-        import torch
+def archive_previous_vlm_outputs(output_dir: str) -> List[str]:
+    """Move previous vlm_captions.jsonl and movie_knowledge_bundle.json into archive_prev_vlm/."""
+    archive_dir = os.path.join(output_dir, "archive_prev_vlm")
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    archived: List[str] = []
 
-        if torch.cuda.is_available():
-            alloc = torch.cuda.memory_allocated() / (1024**3)
-            peak = torch.cuda.max_memory_allocated() / (1024**3)
-            return f"{alloc:.2f} GB (Peak {peak:.2f} GB)"
-    except Exception:
-        pass
-    return "n/a"
+    for fname in ("vlm_captions.jsonl", "movie_knowledge_bundle.json", "stage5_vlm_summary.json"):
+        src = os.path.join(output_dir, fname)
+        if os.path.isfile(src):
+            os.makedirs(archive_dir, exist_ok=True)
+            dst = os.path.join(archive_dir, f"{ts}_{fname}")
+            shutil.move(src, dst)
+            archived.append(dst)
 
-
-def _ram_str() -> str:
-    """Format current process RSS RAM usage if psutil is installed."""
-    try:
-        import psutil
-
-        rss = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
-        return f"{rss:.2f} GB"
-    except Exception:
-        return "n/a"
+    return archived
 
 
 def run_single_scene_diagnostic(
@@ -537,19 +659,29 @@ def run_single_scene_diagnostic(
     scene_index: Optional[int] = 4,
     movie_title: str = "Sintel",
     char_bank_dir: Optional[str] = None,
-    vlm_model_id: str = "Qwen/Qwen3-VL-8B-Instruct",
+    vlm_model_id: str = "deepseek-flash",
+    api_key: Optional[str] = None,
+    api_base_url: str = "https://api.deepseek.com",
     max_keyframes_per_scene: int = 15,
-    min_pixels: int = 256 * 28 * 28,
-    max_pixels: int = 512 * 28 * 28,
+    max_image_width: int = 960,
 ) -> Dict[str, Any]:
-    """Run Pass 1 + Pass 2 on a single scene to inspect caption quality and memory usage."""
+    """Run a single-scene diagnostic call on deepseek-flash to inspect caption quality and token usage."""
     shots_file = os.path.join(output_dir, "shots_and_scenes.json")
     with open(shots_file, "r", encoding="utf-8") as f:
         shots_and_scenes = json.load(f)
 
     movie_id = shots_and_scenes["movie_id"]
+    duration_sec = float(shots_and_scenes.get("duration_sec") or 0.0)
     scenes = shots_and_scenes.get("scenes", [])
+    if not duration_sec and scenes:
+        duration_sec = float(scenes[-1]["end_time"])
+
     glossary = _load_character_glossary(output_dir, char_bank_dir=char_bank_dir)
+    external_docs = _load_external_plot_documents(
+        movie_id=movie_id,
+        duration_sec=duration_sec,
+        char_bank_dir=char_bank_dir,
+    )
     resolve_kf_path = _stage_keyframes_to_local(output_dir, movie_id)
 
     target_idx = 0
@@ -566,30 +698,23 @@ def run_single_scene_diagnostic(
         else "Opening sequence of the film."
     )
 
-    model, processor = load_qwen25_vl(
-        model_id=vlm_model_id,
-        min_pixels=min_pixels,
-        max_pixels=max_pixels,
-    )
+    client = create_deepseek_client(api_key=api_key, api_base_url=api_base_url)
     t0 = time.perf_counter()
-    try:
-        vlm_caption, exit_state, used_kfs = _caption_one_scene(
-            model=model,
-            processor=processor,
-            movie_title=movie_title,
-            scene=scene,
-            resolve_kf_path=resolve_kf_path,
-            glossary=glossary,
-            prev_exit_state=prev_exit_state,
-            prev_subtitles=prev_subtitles,
-            max_keyframes_per_scene=max_keyframes_per_scene,
-        )
-    finally:
-        elapsed = time.perf_counter() - t0
-        ram_after = _ram_str()
-        vram_after = _gpu_vram_str()
-        del model, processor
-        _trim_host_memory(empty_cuda=True)
+    vlm_caption, exit_state, used_kfs, usage = _caption_one_scene(
+        client=client,
+        vlm_model_id=vlm_model_id,
+        movie_id=movie_id,
+        movie_title=movie_title,
+        scene=scene,
+        resolve_kf_path=resolve_kf_path,
+        glossary=glossary,
+        external_docs=external_docs,
+        prev_exit_state=prev_exit_state,
+        prev_subtitles=prev_subtitles,
+        max_keyframes_per_scene=max_keyframes_per_scene,
+        max_image_width=max_image_width,
+    )
+    elapsed = time.perf_counter() - t0
 
     result = {
         "scene_id": scene["scene_id"],
@@ -600,12 +725,14 @@ def run_single_scene_diagnostic(
         "vlm_caption": vlm_caption,
         "exit_state": exit_state,
         "elapsed_sec": round(elapsed, 2),
-        "ram": ram_after,
-        "vram": vram_after,
+        "token_usage": usage,
     }
-    print(f"[Diagnostic {result['scene_id']}] {result['keyframes_used']}/{result['keyframes_total']} kfs | {elapsed:.1f}s | RAM: {ram_after} | VRAM: {vram_after}")
-    print("\n--- Pass 1: vlm_caption ---\n" + vlm_caption)
-    print("\n--- Pass 2: exit_state ---\n" + exit_state)
+    print(
+        f"[Diagnostic {result['scene_id']}] {result['keyframes_used']}/{result['keyframes_total']} kfs | "
+        f"{elapsed:.1f}s | Tokens: {usage['prompt_tokens']} in / {usage['completion_tokens']} out"
+    )
+    print("\n--- [SCENE_DESCRIPTION] (vlm_caption) ---\n" + vlm_caption)
+    print("\n--- [EXIT_STATE] (exit_state) ---\n" + exit_state)
     return result
 
 
@@ -616,16 +743,22 @@ def run_stage5_vlm_caption(
     char_bank_dir: Optional[str] = None,
     glossary_file: Optional[str] = None,
     external_plot_file: Optional[str] = None,
-    vlm_model_id: str = "Qwen/Qwen3-VL-8B-Instruct",
+    vlm_model_id: str = "deepseek-flash",
+    api_key: Optional[str] = None,
+    api_base_url: str = "https://api.deepseek.com",
     max_keyframes_per_scene: int = 15,
-    min_pixels: int = 256 * 28 * 28,
-    max_pixels: int = 512 * 28 * 28,
+    max_image_width: int = 960,
     restart: bool = False,
 ) -> Dict[str, Any]:
-    """Run Two-Pass Qwen2.5-VL captioning across all Scene Windows and assemble the knowledge bundle."""
+    """Run Single-Pass DeepSeek-Flash captioning across all Scene Windows and assemble the knowledge bundle."""
     shots_file = os.path.join(output_dir, "shots_and_scenes.json")
     if not os.path.isfile(shots_file):
         raise FileNotFoundError(f"shots_and_scenes.json not found: {shots_file}")
+
+    if restart:
+        archived_files = archive_previous_vlm_outputs(output_dir)
+        if archived_files:
+            print(f"[Stage A5] Archived previous VLM output files -> {[os.path.basename(p) for p in archived_files]}")
 
     with open(shots_file, "r", encoding="utf-8") as f:
         shots_and_scenes = json.load(f)
@@ -639,9 +772,9 @@ def run_stage5_vlm_caption(
     if not duration_sec and scenes:
         duration_sec = float(scenes[-1]["end_time"])
 
-    # Merge attributed_subtitles.json if present and scenes lack subtitles
+    # Always refresh scene subtitles from attributed_subtitles.json if present
     subtitles_file = os.path.join(output_dir, "attributed_subtitles.json")
-    if os.path.isfile(subtitles_file) and all("subtitles" not in sc for sc in scenes):
+    if os.path.isfile(subtitles_file):
         with open(subtitles_file, "r", encoding="utf-8") as f:
             sub_payload = json.load(f)
         for sc in scenes:
@@ -672,9 +805,7 @@ def run_stage5_vlm_caption(
 
     ckpt_jsonl = os.path.join(output_dir, "vlm_captions.jsonl")
     completed_by_id: Dict[str, Dict[str, Any]] = {}
-    if restart and os.path.isfile(ckpt_jsonl):
-        os.remove(ckpt_jsonl)
-    elif os.path.isfile(ckpt_jsonl):
+    if os.path.isfile(ckpt_jsonl):
         with open(ckpt_jsonl, "r", encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
@@ -688,74 +819,75 @@ def run_stage5_vlm_caption(
 
     pending_scenes = [sc for sc in scenes if sc["scene_id"] not in completed_by_id]
     print(
-        f"[Stage A5] Total scenes: {len(scenes)} | Cached: {len(completed_by_id)} | "
-        f"Pending: {len(pending_scenes)}"
+        f"[Stage A5] Model: {vlm_model_id} | Total scenes: {len(scenes)} | "
+        f"Cached: {len(completed_by_id)} | Pending: {len(pending_scenes)}"
     )
+
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
 
     if pending_scenes:
         resolve_kf_path = _stage_keyframes_to_local(output_dir, movie_id)
-        model, processor = load_qwen25_vl(
-            model_id=vlm_model_id,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-        )
+        client = create_deepseek_client(api_key=api_key, api_base_url=api_base_url)
 
-        try:
-            with open(ckpt_jsonl, "a", encoding="utf-8") as out_f:
-                prev_exit_state = "Opening sequence of the film."
-                prev_subtitles: List[Dict[str, Any]] = []
+        with open(ckpt_jsonl, "a", encoding="utf-8") as out_f:
+            prev_exit_state = "Opening sequence of the film."
+            prev_subtitles: List[Dict[str, Any]] = []
 
-                for idx, sc in enumerate(scenes):
-                    sid = sc["scene_id"]
-                    if sid in completed_by_id:
-                        cached = completed_by_id[sid]
-                        sc["vlm_caption"] = cached["vlm_caption"]
-                        sc["exit_state"] = cached.get("exit_state", "")
-                        prev_exit_state = sc["exit_state"] or prev_exit_state
-                        prev_subtitles = sc.get("subtitles", [])
-                        continue
-
-                    t0 = time.perf_counter()
-                    vlm_caption, exit_state, used_kfs = _caption_one_scene(
-                        model=model,
-                        processor=processor,
-                        movie_title=resolved_title,
-                        scene=sc,
-                        resolve_kf_path=resolve_kf_path,
-                        glossary=glossary,
-                        prev_exit_state=prev_exit_state,
-                        prev_subtitles=prev_subtitles,
-                        max_keyframes_per_scene=max_keyframes_per_scene,
-                    )
-                    elapsed = time.perf_counter() - t0
-
-                    sc["vlm_caption"] = vlm_caption
-                    sc["exit_state"] = exit_state
-                    record = {
-                        "scene_id": sid,
-                        "scene_index": sc.get("scene_index", idx),
-                        "vlm_caption": vlm_caption,
-                        "exit_state": exit_state,
-                        "sampled_keyframe_paths": used_kfs,
-                    }
-                    out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    out_f.flush()
-                    completed_by_id[sid] = record
-
-                    prev_exit_state = exit_state
+            for idx, sc in enumerate(scenes):
+                sid = sc["scene_id"]
+                if sid in completed_by_id:
+                    cached = completed_by_id[sid]
+                    sc["vlm_caption"] = cached["vlm_caption"]
+                    sc["exit_state"] = cached.get("exit_state", "")
+                    prev_exit_state = sc["exit_state"] or prev_exit_state
                     prev_subtitles = sc.get("subtitles", [])
-                    _trim_host_memory(empty_cuda=True)
+                    continue
 
-                    print(
-                        f"[Scene {idx + 1:03d}/{len(scenes):03d} ({sid})] "
-                        f"kfs: {len(used_kfs)}/{len(sc.get('keyframes', []))} | "
-                        f"subs: {len(sc.get('subtitles', []))} | "
-                        f"{elapsed:.1f}s | RAM: {_ram_str()} | VRAM: {_gpu_vram_str()}",
-                        flush=True,
-                    )
-        finally:
-            del model, processor
-            _trim_host_memory(empty_cuda=True)
+                t0 = time.perf_counter()
+                vlm_caption, exit_state, used_kfs, usage = _caption_one_scene(
+                    client=client,
+                    vlm_model_id=vlm_model_id,
+                    movie_id=movie_id,
+                    movie_title=resolved_title,
+                    scene=sc,
+                    resolve_kf_path=resolve_kf_path,
+                    glossary=glossary,
+                    external_docs=external_docs,
+                    prev_exit_state=prev_exit_state,
+                    prev_subtitles=prev_subtitles,
+                    max_keyframes_per_scene=max_keyframes_per_scene,
+                    max_image_width=max_image_width,
+                )
+                elapsed = time.perf_counter() - t0
+                total_prompt_tokens += usage["prompt_tokens"]
+                total_completion_tokens += usage["completion_tokens"]
+
+                sc["vlm_caption"] = vlm_caption
+                sc["exit_state"] = exit_state
+                record = {
+                    "scene_id": sid,
+                    "scene_index": sc.get("scene_index", idx),
+                    "vlm_caption": vlm_caption,
+                    "exit_state": exit_state,
+                    "sampled_keyframe_paths": used_kfs,
+                    "token_usage": usage,
+                }
+                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                out_f.flush()
+                completed_by_id[sid] = record
+
+                prev_exit_state = exit_state
+                prev_subtitles = sc.get("subtitles", [])
+                _trim_host_memory()
+
+                print(
+                    f"[Scene {idx + 1:03d}/{len(scenes):03d} ({sid})] "
+                    f"kfs: {len(used_kfs)}/{len(sc.get('keyframes', []))} | "
+                    f"subs: {len(sc.get('subtitles', []))} | "
+                    f"{elapsed:.1f}s | tokens: {usage['prompt_tokens']} in / {usage['completion_tokens']} out",
+                    flush=True,
+                )
     else:
         for sc in scenes:
             cached = completed_by_id.get(sc["scene_id"], {})
@@ -806,6 +938,8 @@ def run_stage5_vlm_caption(
         "total_scenes": len(bundle_scenes),
         "scenes_captioned": sum(1 for s in bundle_scenes if s.get("vlm_caption")),
         "external_plot_documents": len(external_docs),
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_completion_tokens": total_completion_tokens,
         "bundle_path": bundle_path,
         "bundle_size_mb": round(os.path.getsize(bundle_path) / (1024**2), 3),
     }
@@ -818,16 +952,18 @@ def run_stage5_vlm_caption(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stage A5: Two-Pass Qwen3-VL / Qwen2.5-VL Scene Captioning")
+    parser = argparse.ArgumentParser(description="Stage A5: DeepSeek-Flash Vision API Scene Captioning")
     parser.add_argument("--output_dir", required=True, help="Workdir containing shots_and_scenes.json")
     parser.add_argument("--movie_title", default=None, help="Display title for movie")
     parser.add_argument("--franchise_id", default=None, help="Franchise identifier")
     parser.add_argument("--char_bank_dir", default=None, help="Character bank directory")
     parser.add_argument("--glossary_file", default=None, help="Path to character_glossary.json")
     parser.add_argument("--external_plot_file", default=None, help="Optional Tier-3 plot file")
-    parser.add_argument("--vlm_model_id", default="Qwen/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--vlm_model_id", default="deepseek-flash")
+    parser.add_argument("--api_base_url", default="https://api.deepseek.com")
     parser.add_argument("--max_keyframes_per_scene", type=int, default=15)
-    parser.add_argument("--restart", action="store_true", help="Ignore cached vlm_captions.jsonl")
+    parser.add_argument("--max_image_width", type=int, default=960)
+    parser.add_argument("--restart", action="store_true", help="Archive and ignore cached vlm_captions.jsonl")
     return parser.parse_args()
 
 
@@ -841,6 +977,8 @@ if __name__ == "__main__":
         glossary_file=args.glossary_file,
         external_plot_file=args.external_plot_file,
         vlm_model_id=args.vlm_model_id,
+        api_base_url=args.api_base_url,
         max_keyframes_per_scene=args.max_keyframes_per_scene,
+        max_image_width=args.max_image_width,
         restart=args.restart,
     )
