@@ -122,6 +122,37 @@ def preview_end_of_movie_frames(
     }
 
 
+def _nms_boxes(boxes: Any, scores: Any, iou_threshold: float = 0.45) -> Tuple[List[List[float]], List[float]]:
+    """Run Greedy IoU Non-Maximum Suppression without importing SAM2/tgrp."""
+    import numpy as np
+
+    boxes_np = np.asarray(boxes, dtype=np.float32)
+    scores_np = np.asarray(scores, dtype=np.float32)
+    if len(boxes_np) == 0:
+        return [], []
+
+    order = np.argsort(scores_np)[::-1]
+    keep: List[int] = []
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(boxes_np[i, 0], boxes_np[rest, 0])
+        yy1 = np.maximum(boxes_np[i, 1], boxes_np[rest, 1])
+        xx2 = np.minimum(boxes_np[i, 2], boxes_np[rest, 2])
+        yy2 = np.minimum(boxes_np[i, 3], boxes_np[rest, 3])
+        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+        area_i = max(0.0, boxes_np[i, 2] - boxes_np[i, 0]) * max(0.0, boxes_np[i, 3] - boxes_np[i, 1])
+        area_r = np.maximum(0.0, boxes_np[rest, 2] - boxes_np[rest, 0]) * np.maximum(0.0, boxes_np[rest, 3] - boxes_np[rest, 1])
+        union = area_i + area_r - inter
+        iou = np.where(union > 0, inter / union, 0.0)
+        order = rest[iou <= iou_threshold]
+
+    return boxes_np[keep].tolist(), scores_np[keep].tolist()
+
+
 def harvest_and_cluster_character_crops(
     video_path: str,
     movie_id: str,
@@ -146,7 +177,6 @@ def harvest_and_cluster_character_crops(
     import torch
     from decord import VideoReader, cpu
     from sklearn.cluster import AgglomerativeClustering
-    from tgrp import non_max_suppression
     from torchvision import transforms
     from transformers import Owlv2ForObjectDetection, Owlv2Processor
     from tqdm import tqdm
@@ -249,7 +279,7 @@ def harvest_and_cluster_character_crops(
         if len(boxes) == 0:
             continue
 
-        sel_boxes, sel_scores = non_max_suppression(boxes, scores, iou_threshold=0.45)
+        sel_boxes, sel_scores = _nms_boxes(boxes, scores, iou_threshold=0.45)
         for box, sc in zip(sel_boxes[:max_boxes_per_frame], sel_scores[:max_boxes_per_frame]):
             x1, y1, x2, y2 = [float(c) for c in box]
             bw = max(0.0, x2 - x1)
