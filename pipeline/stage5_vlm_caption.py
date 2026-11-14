@@ -228,14 +228,17 @@ def load_qwen25_vl(
     min_pixels: int = 256 * 28 * 28,
     max_pixels: int = 512 * 28 * 28,
 ):
-    """Load Qwen2.5-VL-7B-Instruct and bounded-resolution AutoProcessor."""
+    """Load Qwen2.5-VL-7B-Instruct and its AutoProcessor with bounded visual token budget."""
     import torch
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else (torch.float16 if torch.cuda.is_available() else torch.float32)
 
-    print(f"[Stage A5] Loading VLM '{model_id}' (dtype={dtype}, max_pixels={max_pixels})...")
+    print(
+        f"[Stage A5] Loading VLM '{model_id}' (dtype={dtype}, "
+        f"min_pixels={min_pixels}, max_pixels={max_pixels})..."
+    )
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_id,
         torch_dtype=dtype,
@@ -552,7 +555,11 @@ def run_single_scene_diagnostic(
         else "Opening sequence of the film."
     )
 
-    model, processor = load_qwen25_vl(model_id=vlm_model_id, min_pixels=min_pixels, max_pixels=max_pixels)
+    model, processor = load_qwen25_vl(
+        model_id=vlm_model_id,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
     t0 = time.perf_counter()
     try:
         vlm_caption, exit_state, used_kfs = _caption_one_scene(

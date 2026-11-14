@@ -754,7 +754,11 @@ def harvest_in_movie_voice_bank(
     # Pass 1: Use explicit SDH subtitles if available
     for utt in utterances:
         spk = utt.get("speaker")
-        if utt.get("source") == "sdh" and spk and len(voice_bank[spk]) < max_examples_per_char:
+        if (
+            utt.get("source") == "sdh"
+            and spk
+            and len(voice_bank[spk]) < max_examples_per_char
+        ):
             sl = _slice_audio(wav_16k, sr, utt["start_time"], utt["end_time"], min_sec=0.8)
             rms = float(np.sqrt(np.mean(sl * sl))) if len(sl) else 0.0
             if rms >= 0.004:
@@ -763,7 +767,7 @@ def harvest_in_movie_voice_bank(
                     voice_bank[spk].append(emb)
 
     # Pass 2: Match speech utterances against high-confidence visual character tracks
-    # Prioritize utterances where exactly ONE character is clearly visible on screen
+    # Prioritize utterances where exactly ONE speaking character is clearly visible on screen
     # (or where LWTNet lip-sync identifies the active speaker).
     candidates_by_char: Dict[str, List[Tuple[float, float, float, Dict[str, Any]]]] = defaultdict(list)
 
@@ -780,7 +784,9 @@ def harvest_in_movie_voice_bank(
             continue
 
         overlaps = [
-            sp for sp in track_spans if min(t1, sp["end_time"]) - max(t0, sp["start_time"]) >= 0.35
+            sp
+            for sp in track_spans
+            if min(t1, sp["end_time"]) - max(t0, sp["start_time"]) >= 0.35
         ]
         if not overlaps:
             continue
@@ -929,10 +935,10 @@ def attribute_speakers_to_subtitles(
         # Overlapping visual character candidates during [t0, t1]
         vis_candidates: Dict[str, Dict[str, Any]] = {}
         for sp in track_spans:
+            char = sp["label"]
             ov = min(t1, sp["end_time"]) - max(t0, sp["start_time"])
             if ov <= 0.15:
                 continue
-            char = sp["label"]
             if char not in vis_candidates or sp["visual_score"] > vis_candidates[char]["visual_score"]:
                 vis_candidates[char] = sp
 
@@ -941,7 +947,8 @@ def attribute_speakers_to_subtitles(
         for sc in scenes:
             if float(sc["start_time"]) <= mid_t <= float(sc["end_time"]):
                 for cp in sc.get("characters_present", []):
-                    scene_chars[cp["name"]] = max(scene_chars.get(cp["name"], 0.0), float(cp.get("max_score", 0.0)))
+                    cname = cp["name"]
+                    scene_chars[cname] = max(scene_chars.get(cname, 0.0), float(cp.get("max_score", 0.0)))
                 break
 
         assigned_speaker: Optional[str] = None
@@ -1086,7 +1093,8 @@ def run_stage4_subtitles(
     if os.path.isfile(charbank_summary_file):
         with open(charbank_summary_file, "r", encoding="utf-8") as f:
             cb_summary = json.load(f)
-        known_characters = sorted(cb_summary.get("glossary", {}).keys() or cb_summary.get("characters", {}).keys())
+        glossary = cb_summary.get("glossary", {}) or {}
+        known_characters = sorted(glossary.keys() or cb_summary.get("characters", {}).keys())
     if not known_characters:
         known_characters = sorted(
             {tr.get("label") for sh in classified_shots for tr in sh.get("tracks", []) if tr.get("label")}
@@ -1217,6 +1225,82 @@ def run_stage4_subtitles(
     print(f"[Stage A4.3] Speaker distribution : {dict(speaker_counts)}")
     print(f"[Stage A4.3] Attribution sources  : {dict(source_counts)}")
     return summary
+
+
+def apply_subtitle_speaker_fixes(
+    output_dir: str,
+    speaker_overrides: Dict[str, str],
+) -> Dict[str, Any]:
+    """Manually patch speaker labels in attributed_subtitles.json & shots_and_scenes.json.
+
+    Args:
+        output_dir: Workdir containing attributed_subtitles.json and shots_and_scenes.json.
+        speaker_overrides: Dict mapping utt_id (e.g. 'utt_0009'), start_time string
+            (e.g. '143.22'), or exact subtitle text to the corrected speaker name.
+    """
+    subtitles_path = os.path.join(output_dir, "attributed_subtitles.json")
+    shots_path = os.path.join(output_dir, "shots_and_scenes.json")
+    summary_path = os.path.join(output_dir, "stage4_audio_summary.json")
+
+    if not os.path.isfile(subtitles_path):
+        raise FileNotFoundError(f"attributed_subtitles.json not found: {subtitles_path}")
+    if not os.path.isfile(shots_path):
+        raise FileNotFoundError(f"shots_and_scenes.json not found: {shots_path}")
+
+    with open(subtitles_path, "r", encoding="utf-8") as f:
+        sub_payload = json.load(f)
+    with open(shots_path, "r", encoding="utf-8") as f:
+        shots_and_scenes = json.load(f)
+
+    utterances = sub_payload.get("utterances", [])
+    overrides = speaker_overrides or {}
+    changes = 0
+
+    for idx, utt in enumerate(utterances):
+        orig_speaker = utt.get("speaker")
+        new_speaker: Optional[str] = None
+        utt_id = str(utt.get("utt_id") or f"utt_{idx:04d}")
+        utt_text = str(utt.get("text", "")).strip()
+        t_start = float(utt.get("start_time", 0.0))
+        t_str_2 = f"{t_start:.2f}"
+
+        # Pure manual overrides: match by utt_id, 2-decimal start_time, or exact text
+        if utt_id in overrides:
+            new_speaker = overrides[utt_id]
+        elif str(idx) in overrides:
+            new_speaker = overrides[str(idx)]
+        elif t_str_2 in overrides:
+            new_speaker = overrides[t_str_2]
+        elif utt_text in overrides:
+            new_speaker = overrides[utt_text]
+
+        if new_speaker and new_speaker != orig_speaker:
+            utt["speaker"] = new_speaker
+            utt["confidence"] = 1.0
+            utt["source"] = "manual_override"
+            changes += 1
+
+    with open(subtitles_path, "w", encoding="utf-8") as f:
+        json.dump(sub_payload, f, indent=2)
+
+    shots_and_scenes = attach_subtitles_to_scenes(shots_and_scenes, utterances)
+    with open(shots_path, "w", encoding="utf-8") as f:
+        json.dump(shots_and_scenes, f, indent=2)
+
+    speaker_counts: Dict[str, int] = defaultdict(int)
+    for u in utterances:
+        speaker_counts[u.get("speaker", "Unknown")] += 1
+
+    if os.path.isfile(summary_path):
+        with open(summary_path, "r", encoding="utf-8") as f:
+            s4 = json.load(f)
+        s4["speaker_counts"] = dict(speaker_counts)
+        s4["manual_speaker_fixes_applied"] = changes
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(s4, f, indent=2)
+
+    print(f"[Stage A4 Fix] Updated {changes} utterance speaker label(s) -> {dict(speaker_counts)}")
+    return {"updated_count": changes, "speaker_counts": dict(speaker_counts), "utterances": utterances}
 
 
 def parse_args() -> argparse.Namespace:
