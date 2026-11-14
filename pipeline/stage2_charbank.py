@@ -599,13 +599,15 @@ def extract_character_features(
         saved_counts[char_name] += 1
 
     if not embed_all and retrieval_images:
-        print("[Stage A2] Scoring & filtering retrieval exemplar images against anchors...")
+        print("[Stage A2] Scoring & selecting multi-state exemplar images...")
         selections: Dict[str, List[Tuple[float, str, np.ndarray]]] = defaultdict(list)
 
         for char_name, idx, image_file in tqdm(retrieval_images, desc="Exemplar Images"):
             if char_name not in anchor_features:
                 continue
-            feats_np = detect_and_embed(os.path.join(staged_movie_dir, image_file), require_detection=use_box)
+            # Use require_detection=False so pre-cropped character exemplars from Stage A0
+            # are never discarded if OWLv2 does not detect a sub-box inside a tight crop.
+            feats_np = detect_and_embed(os.path.join(staged_movie_dir, image_file), require_detection=False)
             if feats_np is None:
                 continue
             anchor_vec = anchor_features[char_name]
@@ -614,8 +616,34 @@ def extract_character_features(
             selections[char_name].append((cos_sim, image_file, feats_np))
 
         for char_name, candidates in selections.items():
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            for cos_sim, image_file, feats_np in candidates[:num_per_character]:
+            if len(candidates) <= num_per_character:
+                chosen = candidates
+            else:
+                # Diversity-preserving Farthest-Point Selection so multi-cluster states
+                # (e.g. young/daylight + older/dark-cave lighting) are all retained.
+                normed_vecs = []
+                for _, _, v in candidates:
+                    n_val = float(np.linalg.norm(v))
+                    normed_vecs.append(v / n_val if n_val > 0 else v)
+                anchor_v = anchor_features[char_name]
+                anchor_n = float(np.linalg.norm(anchor_v))
+                selected_normed = [anchor_v / anchor_n if anchor_n > 0 else anchor_v]
+                remaining_idxs = list(range(len(candidates)))
+                chosen = []
+                while remaining_idxs and len(chosen) < num_per_character:
+                    best_rem_pos = 0
+                    best_min_dist = -1.0
+                    for pos, c_idx in enumerate(remaining_idxs):
+                        cand_v = normed_vecs[c_idx]
+                        min_dist = min(1.0 - float(np.dot(cand_v, sv)) for sv in selected_normed)
+                        if min_dist > best_min_dist:
+                            best_min_dist = min_dist
+                            best_rem_pos = pos
+                    picked_idx = remaining_idxs.pop(best_rem_pos)
+                    selected_normed.append(normed_vecs[picked_idx])
+                    chosen.append(candidates[picked_idx])
+
+            for cos_sim, image_file, feats_np in chosen:
                 npz_name = os.path.splitext(image_file)[0] + ".npz"
                 np.savez(os.path.join(char_features_dir, npz_name), feature=feats_np, character=char_name)
                 saved_counts[char_name] += 1
@@ -640,7 +668,7 @@ def run_stage2_charbank(
     epochs: int = 75,
     learning_rate: float = 6e-4,
     temperature: float = 0.07,
-    num_per_character: int = 8,
+    num_per_character: int = 16,
     use_box: bool = True,
     use_mask: bool = False,
     sam2_checkpoint: Optional[str] = None,
@@ -718,7 +746,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", default=75, type=int, help="Contrastive fine-tuning epochs (default: 75)")
     parser.add_argument("--learning_rate", default=6e-4, type=float, help="Initial learning rate (default: 6e-4)")
     parser.add_argument("--temperature", default=0.07, type=float, help="InfoNCE temperature (default: 0.07)")
-    parser.add_argument("--num_per_character", default=8, type=int, help="Max retrieval exemplars per character")
+    parser.add_argument("--num_per_character", default=16, type=int, help="Max retrieval exemplars per character")
     parser.add_argument("--no_box", action="store_true", help="Disable OWLv2 character box cropping on bank images")
     parser.add_argument("--mask", action="store_true", help="Enable SAM 2.1 instance masking on bank images")
     parser.add_argument("--sam2_checkpoint", default=None, type=str, help="Path to SAM 2.1 checkpoint (if --mask)")

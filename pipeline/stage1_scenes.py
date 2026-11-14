@@ -17,13 +17,33 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Ensure project root is on sys.path when invoked directly as a script
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pipeline import ensure_animated_ad_paths
 
 ensure_animated_ad_paths()
+
+
+def parse_timestamp_sec(val: Optional[Union[str, float, int]]) -> Optional[float]:
+    """Parse a timestamp in seconds (float/int) or 'MM:SS' / 'HH:MM:SS' string into float seconds."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        fval = float(val)
+        return fval if fval > 0 else None
+    s = str(val).strip()
+    if not s or s.lower() in {"none", "null", "0", "0.0"}:
+        return None
+    if ":" in s:
+        parts = [float(p.strip()) for p in s.split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60.0 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
+    fval = float(s)
+    return fval if fval > 0 else None
 
 
 def get_video_metadata(video_path: str) -> Tuple[float, int, float]:
@@ -225,6 +245,77 @@ def group_shots_into_scenes(
     return scenes
 
 
+def apply_credits_cutoff_to_shots_file(
+    shots_file: str,
+    credits_start_sec: Optional[Union[str, float, int]],
+) -> Dict[str, Any]:
+    """Filter or trim shots and scenes at or after `credits_start_sec` on an existing `shots_and_scenes.json`."""
+    cutoff_sec = parse_timestamp_sec(credits_start_sec)
+    if not os.path.isfile(shots_file):
+        raise FileNotFoundError(f"shots_and_scenes.json not found: {shots_file}")
+
+    with open(shots_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if cutoff_sec is None:
+        return data
+
+    fps = float(data.get("fps") or 24.0)
+    cutoff_frame = int(round(cutoff_sec * fps))
+
+    orig_shots = data.get("shots", [])
+    kept_shots: List[Dict[str, Any]] = []
+    for shot in orig_shots:
+        s_f = int(shot["start_frame"])
+        e_f = int(shot["end_frame"])
+        if s_f >= cutoff_frame:
+            continue
+        if e_f > cutoff_frame:
+            shot = dict(shot)
+            shot["end_frame"] = cutoff_frame
+            shot["end_time"] = round(cutoff_frame / fps, 3)
+        kept_shots.append(shot)
+
+    orig_scenes = data.get("scenes", [])
+    kept_scenes: List[Dict[str, Any]] = []
+    for scene in orig_scenes:
+        s_t = float(scene.get("start_time", 0.0))
+        if s_t >= cutoff_sec:
+            continue
+        scene_copy = dict(scene)
+        if float(scene_copy.get("end_time", 0.0)) > cutoff_sec:
+            scene_copy["end_frame"] = min(int(scene_copy["end_frame"]), cutoff_frame)
+            scene_copy["end_time"] = round(min(float(scene_copy["end_time"]), cutoff_sec), 3)
+            scene_copy["duration_sec"] = round(scene_copy["end_time"] - s_t, 3)
+            scene_copy["shot_ranges"] = [
+                sr for sr in scene_copy.get("shot_ranges", [])
+                if int(sr["start_frame"]) < cutoff_frame
+            ]
+            scene_copy["keyframes"] = [
+                kf for kf in scene_copy.get("keyframes", [])
+                if float(kf.get("timestamp", 0.0)) < cutoff_sec
+            ]
+        kept_scenes.append(scene_copy)
+
+    data["credits_start_sec"] = round(cutoff_sec, 3)
+    data["credits_excluded_shots"] = len(orig_shots) - len(kept_shots)
+    data["credits_excluded_scenes"] = len(orig_scenes) - len(kept_scenes)
+    data["num_shots"] = len(kept_shots)
+    data["num_scenes"] = len(kept_scenes)
+    data["shots"] = kept_shots
+    data["scenes"] = kept_scenes
+    data.setdefault("config", {})["credits_start_sec"] = round(cutoff_sec, 3)
+
+    with open(shots_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    print(
+        f"[Stage A1] Applied credits_start_sec={cutoff_sec:.2f}s to {shots_file}: "
+        f"kept {len(kept_shots)}/{len(orig_shots)} shots and {len(kept_scenes)}/{len(orig_scenes)} narrative scenes."
+    )
+    return data
+
+
 def run_stage1_scenes(
     video_path: str,
     movie_id: str,
@@ -235,10 +326,13 @@ def run_stage1_scenes(
     max_shot_sec: float = 20.0,
     sub_shot_sec: float = 15.0,
     detector_threshold: float = 27.0,
+    credits_start_sec: Optional[Union[str, float, int]] = None,
 ) -> Dict[str, Any]:
     """Execute Stage A1 and save `shots_and_scenes.json` to `output_dir`."""
     if not movie_title:
         movie_title = movie_id.replace("_", " ").title()
+
+    cutoff_sec = parse_timestamp_sec(credits_start_sec)
 
     print(f"[Stage A1] Inspecting video metadata: {video_path}")
     fps, total_frames, duration_sec = get_video_metadata(video_path)
@@ -246,7 +340,23 @@ def run_stage1_scenes(
 
     print(f"[Stage A1] Running PySceneDetect ContentDetector (threshold={detector_threshold})...")
     raw_shots = detect_raw_shot_boundaries(video_path, total_frames, threshold=detector_threshold)
-    print(f"  -> Detected {len(raw_shots)} raw camera shots.")
+    total_raw_detected = len(raw_shots)
+    print(f"  -> Detected {total_raw_detected} raw camera shots.")
+
+    excluded_raw_shots = 0
+    if cutoff_sec is not None and cutoff_sec < duration_sec:
+        cutoff_frame = max(1, min(int(round(cutoff_sec * fps)), total_frames))
+        filtered_raw: List[Tuple[int, int]] = []
+        for s_f, e_f in raw_shots:
+            if s_f >= cutoff_frame:
+                excluded_raw_shots += 1
+                continue
+            filtered_raw.append((s_f, min(e_f, cutoff_frame)))
+        raw_shots = filtered_raw
+        print(
+            f"  -> Applied end-credits cutoff at {cutoff_sec:.2f}s (frame {cutoff_frame}): "
+            f"kept {len(raw_shots)} narrative raw shots, excluded {excluded_raw_shots} credit shot(s)."
+        )
 
     shots, num_subdivided = subdivide_long_shots(
         raw_shots=raw_shots,
@@ -282,14 +392,17 @@ def run_stage1_scenes(
         "fps": round(fps, 4),
         "total_frames": total_frames,
         "duration_sec": duration_sec,
+        "credits_start_sec": round(cutoff_sec, 3) if cutoff_sec is not None else None,
+        "credits_excluded_raw_shots": excluded_raw_shots,
         "config": {
             "min_scene_sec": min_scene_sec,
             "max_scene_sec": max_scene_sec,
             "max_shot_sec": max_shot_sec,
             "sub_shot_sec": sub_shot_sec,
             "detector_threshold": detector_threshold,
+            "credits_start_sec": round(cutoff_sec, 3) if cutoff_sec is not None else None,
         },
-        "num_raw_shots": len(raw_shots),
+        "num_raw_shots": total_raw_detected,
         "num_subdivided_shots": num_subdivided,
         "num_shots": len(shots),
         "num_scenes": len(scenes),
@@ -332,6 +445,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="PySceneDetect ContentDetector threshold (default: 27.0)",
     )
+    parser.add_argument(
+        "--credits_start_sec",
+        default=None,
+        type=str,
+        help="Optional timestamp (e.g. '744.0' or '12:24') where closing credits start; excludes credit shots.",
+    )
     return parser.parse_args()
 
 
@@ -347,4 +466,5 @@ if __name__ == "__main__":
         max_shot_sec=args.max_shot_sec,
         sub_shot_sec=args.sub_shot_sec,
         detector_threshold=args.detector_threshold,
+        credits_start_sec=args.credits_start_sec,
     )

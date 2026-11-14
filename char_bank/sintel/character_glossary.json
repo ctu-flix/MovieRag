@@ -1,5 +1,7 @@
 {
-  "Sintel": "Young woman warrior and protagonist searching for her companion dragon Scales; has short dark-brown hair, wears a weathered brown tunic and desert cloak, and carries a wooden staff.",
-  "Scales": "Small, playful baby red dragon with large amber eyes and an injured wing bandaged and nursed back to health by Sintel.",
-  "Shaman": "Elderly tribal healer and gatekeeper with long white dreadlocks and ceremonial robes who questions Sintel inside a desert hut."
+  "Sintel": "Young woman warrior and protagonist searching for her companion dragon Scales; has short dark-brown hair (later shoulder-length and weathered in Act IV), wears a brown tunic and travel cloak, and wields a wooden staff in Act I before claiming the Gatekeeper's curved spear-blade.",
+  "Scales": "Small, playful baby red dragon with large amber eyes and an injured wing bandaged and nursed back to health by Sintel; later revealed to have grown into the Adult Dragon.",
+  "Adult Dragon": "Massive, fierce winged red dragon dwelling in the dark volcanic cavern with a healed childhood scar on its wing; guards a fledgling baby dragon.",
+  "Shaman": "Elderly tribal healer and gatekeeper with long white dreadlocks and ceremonial robes who questions Sintel inside a desert hut.",
+  "Gatekeeper": "Masked desert warrior wearing a full ceremonial mask and heavy robes who guards the mountain pass and wields a distinctive curved spear-blade with a circular hilt ring."
 }

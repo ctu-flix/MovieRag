@@ -45,7 +45,7 @@ import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 if TYPE_CHECKING:
     import numpy as np
@@ -781,10 +781,13 @@ def extract_adaptive_annotated_keyframes(
     frames_predictions: Dict[str, Dict[str, List[Any]]],
     output_dir: str,
     visual_prompt_thresh: float = 0.45,
-    short_shot_sec: float = 2.0,
-    interval_sec: float = 2.0,
+    short_shot_sec: float = 1.0,
+    interval_sec: float = 1.0,
+    max_keyframes_per_scene: int = 30,
+    min_sharpness_floor: float = 10.0,
+    pinned_timestamps: Optional[Dict[str, List[float]]] = None,
 ) -> Dict[str, Any]:
-    """Extract adaptive sharp per-shot keyframes and draw color-coded character bounding boxes."""
+    """Extract adaptive sharp + motion-aware per-shot keyframes (up to 30/scene) and draw character boxes."""
     import cv2
     import numpy as np
     from decord import VideoReader, cpu
@@ -798,6 +801,13 @@ def extract_adaptive_annotated_keyframes(
     os.makedirs(keyframes_dir, exist_ok=True)
 
     total_keyframes_saved = 0
+    pinned_map = pinned_timestamps or {}
+
+    def _find_shot_idx_for_frame(scene_shots: List[Dict[str, Any]], f_idx: int) -> int:
+        for sh in scene_shots:
+            if int(sh["start_frame"]) <= f_idx < int(sh["end_frame"]):
+                return int(sh["shot_idx"])
+        return int(scene_shots[-1]["shot_idx"]) if scene_shots else 0
 
     for scene_counter, scene in enumerate(tqdm(shots_and_scenes.get("scenes", []), desc="Adaptive Annotated Keyframes")):
         if scene_counter > 0 and scene_counter % 5 == 0:
@@ -805,6 +815,19 @@ def extract_adaptive_annotated_keyframes(
             _trim_host_memory()
             vr = VideoReader(video_path, ctx=cpu(0))
         scene_id = scene["scene_id"]
+        if scene.get("is_credits", False):
+            scene["characters_present"] = []
+            scene["keyframes"] = []
+            continue
+
+        # Remove any stale keyframe files for this scene before writing fresh ones
+        for existing_fname in os.listdir(keyframes_dir):
+            if existing_fname.startswith(f"{scene_id}_") and existing_fname.endswith(".jpg"):
+                try:
+                    os.remove(os.path.join(keyframes_dir, existing_fname))
+                except OSError:
+                    pass
+
         scene_start_f = max(0, min(int(scene["start_frame"]), total_frames))
         scene_end_f = max(0, min(int(scene["end_frame"]), total_frames))
         scene_total_frames = max(1, scene_end_f - scene_start_f)
@@ -848,9 +871,10 @@ def extract_adaptive_annotated_keyframes(
             )
 
         scene["characters_present"] = characters_present_list
-        scene_keyframes: List[Dict[str, Any]] = []
+        raw_candidates: List[Dict[str, Any]] = []
+        scene_shots = scene.get("shot_ranges", [])
 
-        for shot in scene.get("shot_ranges", []):
+        for shot in scene_shots:
             shot_idx = int(shot["shot_idx"])
             s_frame = max(0, min(int(shot["start_frame"]), total_frames))
             e_frame = max(0, min(int(shot["end_frame"]), total_frames))
@@ -871,85 +895,195 @@ def extract_adaptive_annotated_keyframes(
                         intervals.append((int_s, int_e))
 
             for int_s, int_e in intervals:
+                full_range = list(range(int_s, int_e))
+                if not full_range:
+                    continue
+
+                # Evenly sample up to 12 frames across the full interval PLUS up to 4 frames with detections
+                if len(full_range) > 12:
+                    even_idxs = np.linspace(0, len(full_range) - 1, 12, dtype=int)
+                    sampled_set = {full_range[i] for i in even_idxs}
+                else:
+                    sampled_set = set(full_range)
+
                 frames_with_chars = [
                     f_i
-                    for f_i in range(int_s, int_e)
+                    for f_i in full_range
                     if any(
                         float(sc) > visual_prompt_thresh
                         for sc in frames_predictions.get(str(f_i), {}).get("scores", [])
                     )
                 ]
-                candidate_pool = frames_with_chars if frames_with_chars else list(range(int_s, int_e))
+                if frames_with_chars:
+                    char_idxs = np.linspace(0, len(frames_with_chars) - 1, min(4, len(frames_with_chars)), dtype=int)
+                    for ci in char_idxs:
+                        sampled_set.add(frames_with_chars[ci])
 
-                if len(candidate_pool) > 16:
-                    idxs = np.linspace(0, len(candidate_pool) - 1, 16, dtype=int)
-                    candidate_pool = [candidate_pool[i] for i in idxs]
-
+                candidate_pool = sorted(sampled_set)
                 decoded_candidates = vr.get_batch(candidate_pool).asnumpy()
-                best_frame_idx = candidate_pool[0]
-                best_frame_rgb = decoded_candidates[0].copy()
-                best_sharpness = -1.0
+
+                cand_metrics: List[Dict[str, Any]] = []
+                prev_gray: Optional[np.ndarray] = None
 
                 for cand_f_idx, cand_rgb in zip(candidate_pool, decoded_candidates):
                     gray = cv2.cvtColor(cand_rgb, cv2.COLOR_RGB2GRAY)
                     sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-                    if sharpness > best_sharpness:
-                        best_sharpness = sharpness
-                        best_frame_idx = int(cand_f_idx)
-                        best_frame_rgb = cand_rgb.copy()
+                    brightness = float(gray.mean())
+                    if prev_gray is not None:
+                        motion_delta = float(np.mean(np.abs(gray.astype(np.float32) - prev_gray.astype(np.float32))))
+                    else:
+                        motion_delta = 0.0
+                    prev_gray = gray
 
-                del decoded_candidates
-                pred = frames_predictions.get(str(best_frame_idx), {})
-                best_box_per_char: Dict[str, Tuple[float, List[int]]] = {}
-                for bbox, label, score in zip(
-                    pred.get("bbox_ls", []),
-                    pred.get("labels", []),
-                    pred.get("scores", []),
-                ):
-                    sc = float(score)
-                    if sc <= visual_prompt_thresh or label not in char_to_color:
-                        continue
-                    if label not in best_box_per_char or sc > best_box_per_char[label][0]:
-                        best_box_per_char[label] = (sc, [int(round(c)) for c in bbox])
+                    f_scores = [
+                        float(sc)
+                        for sc in frames_predictions.get(str(cand_f_idx), {}).get("scores", [])
+                        if float(sc) > visual_prompt_thresh
+                    ]
+                    max_char_sc = max(f_scores) if f_scores else 0.0
 
-                boxes_to_draw: List[Tuple[str, List[float], str, List[int]]] = []
-                characters_visible_meta: List[Dict[str, Any]] = []
-
-                for char_name in sorted_chars:
-                    if char_name not in best_box_per_char:
-                        continue
-                    sc, bbox_int = best_box_per_char[char_name]
-                    color_name, rgb_val = char_to_color[char_name]
-                    boxes_to_draw.append((char_name, bbox_int, color_name, rgb_val))
-                    characters_visible_meta.append(
+                    cand_metrics.append(
                         {
-                            "name": char_name,
-                            "color": color_name,
-                            "bbox": bbox_int,
-                            "score": round(sc, 4),
+                            "frame_idx": int(cand_f_idx),
+                            "rgb": cand_rgb,
+                            "sharpness": sharpness,
+                            "brightness": brightness,
+                            "motion_delta": motion_delta,
+                            "char_score": max_char_sc,
                         }
                     )
 
-                annotated_rgb = overlay_character_boxes_on_frame(best_frame_rgb, boxes_to_draw)
-                timestamp_sec = round(best_frame_idx / fps, 2)
-                kf_filename = f"{scene_id}_shot{shot_idx}_{timestamp_sec:06.2f}s.jpg"
-                kf_rel_path = f"keyframes/{kf_filename}"
-                kf_abs_path = os.path.join(keyframes_dir, kf_filename)
+                max_sharp = max(m["sharpness"] for m in cand_metrics)
+                max_motion = max((m["motion_delta"] for m in cand_metrics), default=0.0)
+                sharp_cutoff = max(min_sharpness_floor, 0.40 * max_sharp)
 
-                cv2.imwrite(kf_abs_path, annotated_rgb[:, :, ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-                total_keyframes_saved += 1
+                # Step A: Filter out blurry or pure-black fade frames first
+                sharp_pool = [
+                    m for m in cand_metrics
+                    if m["sharpness"] >= sharp_cutoff and m["brightness"] >= 3.5
+                ]
+                if not sharp_pool:
+                    sharp_pool = [max(cand_metrics, key=lambda m: m["sharpness"])]
 
-                scene_keyframes.append(
+                # Step B: Rank sharp candidates by sharpness + visual-change peak + character presence
+                def _score_candidate(m: Dict[str, Any]) -> float:
+                    norm_sharp = m["sharpness"] / max(max_sharp, 1.0)
+                    norm_motion = (m["motion_delta"] / max(max_motion, 1.0)) if max_motion > 1.5 else 0.0
+                    char_bonus = 0.20 if m["char_score"] > visual_prompt_thresh else 0.0
+                    return 0.45 * norm_sharp + 0.35 * norm_motion + char_bonus
+
+                best_cand = max(sharp_pool, key=_score_candidate)
+                raw_candidates.append(
                     {
                         "shot_idx": shot_idx,
-                        "frame_idx": best_frame_idx,
-                        "timestamp": timestamp_sec,
-                        "sharpness": round(best_sharpness, 2),
-                        "path": kf_rel_path,
-                        "characters_visible": characters_visible_meta,
+                        "frame_idx": best_cand["frame_idx"],
+                        "rgb": best_cand["rgb"].copy(),
+                        "sharpness": best_cand["sharpness"],
+                        "motion_delta": best_cand["motion_delta"],
+                        "pinned": False,
+                    }
+                )
+                del decoded_candidates, cand_metrics, sharp_pool
+
+        # Optional: Force-include human-pinned timestamps for this scene
+        scene_pins = pinned_map.get(scene_id, [])
+        for pin_sec in scene_pins:
+            pin_f = max(scene_start_f, min(int(round(float(pin_sec) * fps)), scene_end_f - 1))
+            if any(abs(c["frame_idx"] - pin_f) <= max(1, int(round(0.35 * fps))) for c in raw_candidates):
+                for c in raw_candidates:
+                    if abs(c["frame_idx"] - pin_f) <= max(1, int(round(0.35 * fps))):
+                        c["pinned"] = True
+                continue
+            pin_rgb = vr.get_batch([pin_f]).asnumpy()[0].copy()
+            pin_gray = cv2.cvtColor(pin_rgb, cv2.COLOR_RGB2GRAY)
+            pin_sharp = float(cv2.Laplacian(pin_gray, cv2.CV_64F).var())
+            raw_candidates.append(
+                {
+                    "shot_idx": _find_shot_idx_for_frame(scene_shots, pin_f),
+                    "frame_idx": pin_f,
+                    "rgb": pin_rgb,
+                    "sharpness": pin_sharp,
+                    "motion_delta": 999.0,
+                    "pinned": True,
+                }
+            )
+
+        raw_candidates.sort(key=lambda c: c["frame_idx"])
+
+        # Cap at max_keyframes_per_scene (default 30) while preserving pinned frames and temporal coverage
+        if max_keyframes_per_scene > 0 and len(raw_candidates) > max_keyframes_per_scene:
+            pinned_only = [c for c in raw_candidates if c.get("pinned")]
+            unpinned = [c for c in raw_candidates if not c.get("pinned")]
+            budget = max(0, max_keyframes_per_scene - len(pinned_only))
+            if budget > 0 and unpinned:
+                sel_idxs = np.linspace(0, len(unpinned) - 1, min(budget, len(unpinned)), dtype=int)
+                kept_unpinned = [unpinned[i] for i in sel_idxs]
+            else:
+                kept_unpinned = []
+            selected_candidates = sorted(pinned_only + kept_unpinned, key=lambda c: c["frame_idx"])
+        else:
+            selected_candidates = raw_candidates
+
+        scene_keyframes: List[Dict[str, Any]] = []
+        for cand in selected_candidates:
+            best_frame_idx = int(cand["frame_idx"])
+            best_frame_rgb = cand["rgb"]
+            best_sharpness = float(cand["sharpness"])
+            shot_idx = int(cand["shot_idx"])
+
+            pred = frames_predictions.get(str(best_frame_idx), {})
+            best_box_per_char: Dict[str, Tuple[float, List[int]]] = {}
+            for bbox, label, score in zip(
+                pred.get("bbox_ls", []),
+                pred.get("labels", []),
+                pred.get("scores", []),
+            ):
+                sc = float(score)
+                if sc <= visual_prompt_thresh or label not in char_to_color:
+                    continue
+                if label not in best_box_per_char or sc > best_box_per_char[label][0]:
+                    best_box_per_char[label] = (sc, [int(round(c)) for c in bbox])
+
+            boxes_to_draw: List[Tuple[str, List[float], str, List[int]]] = []
+            characters_visible_meta: List[Dict[str, Any]] = []
+
+            for char_name in sorted_chars:
+                if char_name not in best_box_per_char:
+                    continue
+                sc, bbox_int = best_box_per_char[char_name]
+                color_name, rgb_val = char_to_color[char_name]
+                boxes_to_draw.append((char_name, bbox_int, color_name, rgb_val))
+                characters_visible_meta.append(
+                    {
+                        "name": char_name,
+                        "color": color_name,
+                        "bbox": bbox_int,
+                        "score": round(sc, 4),
                     }
                 )
 
+            annotated_rgb = overlay_character_boxes_on_frame(best_frame_rgb, boxes_to_draw)
+            timestamp_sec = round(best_frame_idx / fps, 2)
+            kf_filename = f"{scene_id}_shot{shot_idx}_{timestamp_sec:06.2f}s.jpg"
+            kf_rel_path = f"keyframes/{kf_filename}"
+            kf_abs_path = os.path.join(keyframes_dir, kf_filename)
+
+            cv2.imwrite(kf_abs_path, annotated_rgb[:, :, ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            total_keyframes_saved += 1
+
+            kf_entry: Dict[str, Any] = {
+                "shot_idx": shot_idx,
+                "frame_idx": best_frame_idx,
+                "timestamp": timestamp_sec,
+                "sharpness": round(best_sharpness, 2),
+                "path": kf_rel_path,
+                "characters_visible": characters_visible_meta,
+            }
+            if cand.get("pinned"):
+                kf_entry["pinned"] = True
+            scene_keyframes.append(kf_entry)
+
+        del raw_candidates, selected_candidates
         scene["keyframes"] = scene_keyframes
 
     del vr
@@ -966,6 +1100,48 @@ def extract_adaptive_annotated_keyframes(
     return shots_and_scenes
 
 
+def reextract_keyframes_only(
+    video_path: str,
+    shots_file: str,
+    output_dir: str,
+    visual_prompt_thresh: float = 0.45,
+    short_shot_sec: float = 1.0,
+    interval_sec: float = 1.0,
+    max_keyframes_per_scene: int = 30,
+    min_sharpness_floor: float = 10.0,
+    credits_start_sec: Optional[Union[str, float, int]] = None,
+    pinned_timestamps: Optional[Dict[str, List[float]]] = None,
+) -> Dict[str, Any]:
+    """Re-run only Step 3.3 (adaptive keyframe selection & box drawing) using existing `visual_tracks_per_frame.json`."""
+    from pipeline.stage1_scenes import apply_credits_cutoff_to_shots_file
+
+    if credits_start_sec is not None:
+        apply_credits_cutoff_to_shots_file(shots_file, credits_start_sec)
+
+    with open(shots_file, "r", encoding="utf-8") as f:
+        shots_and_scenes = json.load(f)
+
+    visual_tracks_path = os.path.join(output_dir, "visual_tracks_per_frame.json")
+    frames_predictions: Dict[str, Dict[str, List[Any]]] = {}
+    if os.path.isfile(visual_tracks_path):
+        with open(visual_tracks_path, "r", encoding="utf-8") as f:
+            frames_predictions = json.load(f).get("frames", {})
+
+    with _local_video_context(video_path) as active_video_path:
+        return extract_adaptive_annotated_keyframes(
+            video_path=active_video_path,
+            shots_and_scenes=shots_and_scenes,
+            frames_predictions=frames_predictions,
+            output_dir=output_dir,
+            visual_prompt_thresh=visual_prompt_thresh,
+            short_shot_sec=short_shot_sec,
+            interval_sec=interval_sec,
+            max_keyframes_per_scene=max_keyframes_per_scene,
+            min_sharpness_floor=min_sharpness_floor,
+            pinned_timestamps=pinned_timestamps,
+        )
+
+
 def run_stage3_visual_recog(
     video_path: str,
     shots_file: str,
@@ -978,17 +1154,28 @@ def run_stage3_visual_recog(
     visual_prompt_thresh: float = 0.45,
     voice_harvest_thresh: float = 0.60,
     max_boxes_per_seed: int = 5,
+    short_shot_sec: float = 1.0,
+    interval_sec: float = 1.0,
+    max_keyframes_per_scene: int = 30,
+    min_sharpness_floor: float = 10.0,
+    credits_start_sec: Optional[Union[str, float, int]] = None,
+    pinned_timestamps: Optional[Dict[str, List[float]]] = None,
     restart: bool = False,
 ) -> Dict[str, Any]:
     """Run all 3 steps of Stage A3 and return summary statistics."""
     if not os.path.isfile(shots_file):
         raise FileNotFoundError(f"shots_and_scenes.json not found: {shots_file}")
 
+    if credits_start_sec is not None:
+        from pipeline.stage1_scenes import apply_credits_cutoff_to_shots_file
+
+        apply_credits_cutoff_to_shots_file(shots_file, credits_start_sec)
+
     with open(shots_file, "r", encoding="utf-8") as f:
         shots_and_scenes = json.load(f)
 
     movie_id = shots_and_scenes["movie_id"]
-    shots = shots_and_scenes["shots"]
+    shots = [s for s in shots_and_scenes["shots"] if not s.get("is_credits", False)]
 
     tgrp_jsonl_path = os.path.join(output_dir, "tgrp_tracks.jsonl")
 
@@ -1026,6 +1213,11 @@ def run_stage3_visual_recog(
             frames_predictions=visual_tracks_payload["frames"],
             output_dir=output_dir,
             visual_prompt_thresh=visual_prompt_thresh,
+            short_shot_sec=short_shot_sec,
+            interval_sec=interval_sec,
+            max_keyframes_per_scene=max_keyframes_per_scene,
+            min_sharpness_floor=min_sharpness_floor,
+            pinned_timestamps=pinned_timestamps,
         )
 
     return {
@@ -1082,6 +1274,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Maximum OWLv2 boxes propagated per seed frame (default: 5)",
     )
+    parser.add_argument("--short_shot_sec", default=1.0, type=float, help="Short shot threshold in seconds (default: 1.0)")
+    parser.add_argument("--interval_sec", default=1.0, type=float, help="Keyframe sampling interval in seconds (default: 1.0)")
+    parser.add_argument("--max_keyframes_per_scene", default=30, type=int, help="Max keyframes per scene (default: 30)")
+    parser.add_argument("--min_sharpness_floor", default=10.0, type=float, help="Minimum Laplacian sharpness floor (default: 10.0)")
+    parser.add_argument(
+        "--credits_start_sec",
+        default=None,
+        type=str,
+        help="Optional timestamp (e.g. '744.0' or '12:24') where closing credits start",
+    )
     parser.add_argument("--restart", action="store_true", help="Discard existing tgrp_tracks.jsonl and restart TGRP")
     return parser.parse_args()
 
@@ -1100,5 +1302,10 @@ if __name__ == "__main__":
         visual_prompt_thresh=args.visual_prompt_thresh,
         voice_harvest_thresh=args.voice_harvest_thresh,
         max_boxes_per_seed=args.max_boxes_per_seed,
+        short_shot_sec=args.short_shot_sec,
+        interval_sec=args.interval_sec,
+        max_keyframes_per_scene=args.max_keyframes_per_scene,
+        min_sharpness_floor=args.min_sharpness_floor,
+        credits_start_sec=args.credits_start_sec,
         restart=args.restart,
     )
