@@ -1,19 +1,23 @@
 """Stage A5: Single-Pass DeepSeek-Flash Vision API Scene Captioning & Knowledge Bundle Assembly.
 
 Implements Phase A Stage A5 for MovieRAG:
-1. Selects up to `max_keyframes_per_scene` (default 15, i.e. 1 frame per 2s across a 15-30s
-   Scene Window) preserving start/end anchors and prioritizing character boxes.
+1. Filters out blurry / fade-to-black keyframes (`sharpness < min_sharpness`) and selects up to
+   `max_keyframes_per_scene` (default 30, i.e. 1 frame per 1s across a 15-30s Scene Window)
+   preserving start/end anchors, pinned timestamps, and character boxes.
 2. Stages keyframes to fast local SSD (/content/vlm_scratch) in Colab and downscales frames
    in memory (default max_image_width=960) before Base64 JPEG encoding to cut image token
    usage roughly in half without losing scene detail.
-3. Calls `deepseek-flash` via the OpenAI-compatible DeepSeek Vision API (`thinking={"type": "disabled"}`)
+3. Supports manual `credits_start_sec` cutoff (e.g. `744.0` or `"12:24"`) so end-credit scenes
+   are excluded before calling the VLM API or indexing into `movie_knowledge_bundle.json`.
+4. Calls `deepseek-flash` via the OpenAI-compatible DeepSeek Vision API (`thinking={"type": "disabled"}`)
    in a single structured pass per scene to generate both:
-   - `vlm_caption`: Detailed character-grounded chronological narrative (200-400 words).
-   - `exit_state`: Concise 2-3 sentence scene summary & continuity handoff for the next scene.
-4. Grounds each scene with the full Character Reference Glossary and the time-matched Act
-   synopsis from `external_plot.txt` so dark/silent scenes stay anchored to the true story
-   without leaking future spoilers.
-5. Checkpoints every completed scene immediately to `vlm_captions.jsonl` and packages
+   - `vlm_caption`: Detailed action-dense chronological narrative (180-350 words) without repetitive
+     character bio boilerplate.
+   - `exit_state`: Strict 2-3 sentence physical & spatial state ledger (location, character positions
+     & conditions, held/dropped weapons & props) for clean continuity handoff.
+5. Grounds each scene with the full Character Reference Glossary (`Sintel`, `Scales`, `Adult Dragon`,
+   `Shaman`, `Gatekeeper`) and the time-matched Act synopsis from `external_plot.txt`.
+6. Checkpoints every completed scene immediately to `vlm_captions.jsonl` and packages
    `movie_knowledge_bundle.json`.
 """
 
@@ -28,9 +32,10 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from pipeline import PROJECT_ROOT
+from pipeline.stage1_scenes import apply_credits_cutoff_to_shots_file, parse_timestamp_sec
 
 
 SINTEL_FALLBACK_PLOT = (
@@ -109,12 +114,28 @@ def _parse_mmss_to_sec(mmss: str) -> float:
 
 def select_scene_keyframes(
     keyframes: List[Dict[str, Any]],
-    max_frames: int = 15,
+    max_frames: int = 30,
+    min_sharpness: float = 5.0,
 ) -> List[Dict[str, Any]]:
-    """Select <= max_frames keyframes preserving start/end anchors and character boxes."""
+    """Filter out near-zero blurry/fade frames and select <= max_frames keyframes."""
     if not keyframes:
         return []
     ordered = sorted(keyframes, key=lambda kf: int(kf.get("frame_idx", 0)))
+
+    # Filter out blurry or black-fade keyframes (e.g., sharpness < 5.0) unless all frames are below threshold
+    if min_sharpness > 0.0:
+        sharp_filtered = [
+            kf for kf in ordered
+            if kf.get("pinned", False) or float(kf.get("sharpness", 100.0)) >= min_sharpness
+        ]
+        if sharp_filtered:
+            ordered = sharp_filtered
+        else:
+            # Fallback if an entire scene is soft-focus/dark: keep top sharpest frames
+            by_sharp = sorted(ordered, key=lambda kf: float(kf.get("sharpness", 0.0)), reverse=True)
+            keep_n = min(len(by_sharp), max(2, max_frames // 2))
+            ordered = sorted(by_sharp[:keep_n], key=lambda kf: int(kf.get("frame_idx", 0)))
+
     if len(ordered) <= max_frames or max_frames <= 2:
         return ordered[:max_frames]
 
@@ -133,6 +154,7 @@ def select_scene_keyframes(
         best_kf = max(
             bucket,
             key=lambda kf: (
+                1 if kf.get("pinned", False) else 0,
                 1 if len(kf.get("characters_visible", [])) > 0 else 0,
                 len(kf.get("characters_visible", [])),
                 float(kf.get("sharpness", 0.0)),
@@ -172,31 +194,43 @@ def _load_character_glossary(
     char_bank_dir: Optional[str] = None,
     glossary_file: Optional[str] = None,
 ) -> Dict[str, str]:
-    """Load static character glossary from explicit path, Stage A2 summary, or char_bank."""
-    candidates: List[str] = []
-    if glossary_file:
-        candidates.append(glossary_file)
-    if char_bank_dir:
-        candidates.append(os.path.join(char_bank_dir, "character_glossary.json"))
-    candidates.append(str(PROJECT_ROOT / "char_bank" / os.path.basename(output_dir.rstrip("/")) / "character_glossary.json"))
+    """Load and merge static character glossary so newly added entities (e.g. Adult Dragon, Gatekeeper) are always present."""
+    merged: Dict[str, str] = {}
 
+    # 1. Start with stage2_charbank_summary.json as base if present
     stage2_summary = os.path.join(output_dir, "stage2_charbank_summary.json")
     if os.path.isfile(stage2_summary):
         try:
             with open(stage2_summary, "r", encoding="utf-8") as f:
                 s2 = json.load(f)
-            if isinstance(s2.get("glossary"), dict) and s2["glossary"]:
-                return {str(k): str(v) for k, v in s2["glossary"].items()}
+            if isinstance(s2.get("glossary"), dict):
+                for k, v in s2["glossary"].items():
+                    merged[str(k)] = str(v)
         except Exception:
             pass
 
+    # 2. Overlay repo char_bank, Drive char_bank, workdir glossary, and explicit glossary_file
+    movie_slug = os.path.basename(output_dir.rstrip("/"))
+    candidates: List[str] = [
+        str(PROJECT_ROOT / "char_bank" / movie_slug / "character_glossary.json"),
+        os.path.join(output_dir, "character_glossary.json"),
+    ]
+    if char_bank_dir:
+        candidates.append(os.path.join(char_bank_dir, "character_glossary.json"))
+    if glossary_file:
+        candidates.append(glossary_file)
+
     for cand in candidates:
         if cand and os.path.isfile(cand):
-            with open(cand, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return {str(k): str(v) for k, v in data.items()}
-    return {}
+            try:
+                with open(cand, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        merged[str(k)] = str(v)
+            except Exception:
+                pass
+    return merged
 
 
 def _load_external_plot_documents(
@@ -421,12 +455,17 @@ def build_single_pass_prompt(
     act_block = ""
     if act_plot_context:
         act_block = (
-            f"[Time-Matched Act Reference (Broad Context Only)]\n"
+            f"[Time-Matched Act Reference (Narrative Grounding)]\n"
             f"{act_plot_context}\n"
-            f"IMPORTANT: Use this Act Reference ONLY to recognize characters, creatures, and the true "
-            f"narrative setting (especially in dark or wide shots). Describe ONLY the specific visual "
-            f"events occurring within [{t0_str} - {t1_str}] shown in these frames—do NOT narrate events "
-            f"from earlier or later in the Act.\n\n"
+            f"IMPORTANT GROUNDING RULES:\n"
+            f"1. Use this Act Reference to accurately recognize characters, creatures (such as the masked Gatekeeper, "
+            f"baby Scales, or the giant Adult Dragon), weapons (wooden staff vs. Gatekeeper's curved spear-blade with a "
+            f"circular hilt ring), and the true setting—especially during fast action cuts, travel montages, or dark cavern shots.\n"
+            f"2. NEVER invent non-existent monsters (such as wolves), indoor trees, or magical glowing shapes that contradict "
+            f"the Act Reference, and NEVER omit critical physical plot beats visible in this window [{t0_str} - {t1_str}] "
+            f"(such as disarming the Gatekeeper and claiming his spear-blade, driving the spear into the Adult Dragon's chest "
+            f"after it hesitates and discovering its healed wing-scar, or the orphaned baby dragon quietly following Sintel).\n"
+            f"3. Describe ONLY the events occurring within [{t0_str} - {t1_str}] shown in the attached keyframes.\n\n"
         )
 
     return (
@@ -434,33 +473,42 @@ def build_single_pass_prompt(
         f"Number of chronological keyframes attached: {len(sampled_kfs)}\n"
         f"Keyframe Timeline: {kf_timeline}\n\n"
         f"[Character Reference Glossary]\n{glossary_str}\n"
-        f"IMPORTANT: Use this glossary to identify characters accurately and respect their canonical appearance "
-        f"(for example, Sintel has short dark-brown hair, NOT red hair; Shaman has white dreadlocks, no mask). "
-        f"Do NOT claim a character is holding a weapon or wearing gear from the glossary if it is not visible in these frames.\n\n"
+        f"IMPORTANT ANTI-BOILERPLATE & APPEARANCE RULES:\n"
+        f"1. Refer to known characters directly by name (`Sintel`, `Scales`, `Adult Dragon`, `Shaman`, `Gatekeeper`).\n"
+        f"2. DO NOT repeat static character bio introductions from the glossary in every scene (e.g., do NOT start scenes "
+        f"with boilerplate like 'Sintel, a young woman with short dark-brown hair wearing a brown tunic...'). Only describe "
+        f"physical traits when they visibly change or are directly relevant to the action in this scene (such as injuries, "
+        f"aging/longer hair in Act IV, the healed wing-scar on the Adult Dragon, or weapon swaps).\n"
+        f"3. Respect canonical traits (Sintel has dark-brown hair, NOT red hair; Shaman has white dreadlocks, no mask; "
+        f"Gatekeeper wears a full ceremonial mask).\n\n"
         f"[Synthetic Tracking Box Overlay Key]\n"
         f"Overlay key: {legend_str}\n"
         f"CRITICAL VISUAL RULE: Any colored rectangles drawn on the frames are synthetic computer-vision tracking overlays. "
         f"NEVER mention bounding boxes, rectangles, box colors, or 'Frame 1/2' labels in your output, and NEVER confuse "
         f"a red/green/blue tracking box with hair color, clothing color, or glowing objects.\n\n"
         f"{act_block}"
-        f"[Previous Scene Continuity]\n"
+        f"[Previous Scene Continuity (Physical Entry State)]\n"
         f"State entering this scene: {prev_exit_state or 'Opening sequence of the film.'}\n"
         f"Recent lines before this scene:\n{prev_subs_str}\n\n"
         f"[Spoken Dialogue in This Scene]\n{cur_subs_str}\n\n"
         f"[Task]\n"
         f"Respond using EXACTLY the two section headers below:\n\n"
         f"[SCENE_DESCRIPTION]\n"
-        f"Write ONE rich, cohesive, detailed narrative description (180-350 words, scaling naturally with the amount "
+        f"Write ONE rich, cohesive, action-dense narrative description (180-350 words, scaling naturally with the amount "
         f"of action—stop immediately once the final frame is described and NEVER repeat sentences) in present tense:\n"
-        f"1. Setting & Atmosphere: Describe the location, lighting, weather, and props actually visible.\n"
-        f"2. Character Identification & Movements: Name recognized characters by their proper names and describe any "
-        f"unrecognized characters/creatures accurately (e.g., masked gatekeeper warrior, giant Adult Dragon).\n"
-        f"3. Actions & Chronology: Narrate step-by-step who does what across the frames. {dialogue_guidance}\n"
-        f"4. Interactions & Expressions: Describe eye contact, physical condition, and emotional reactions.\n\n"
+        f"1. Setting & Staging: Describe the specific environment, lighting, weather, camera framing, and spatial layout.\n"
+        f"2. Chronological Action & Cause-and-Effect: Trace step-by-step what happens across the keyframes, paying close "
+        f"attention to combat strikes, weapon/prop acquisitions or drops, character movements, and transitions. {dialogue_guidance}\n"
+        f"3. Micro-Expressions & Physical Reactions: Describe eye contact, posture shifts, wounds, and concrete reactions "
+        f"without repeating generic character bios.\n\n"
         f"[EXIT_STATE]\n"
-        f"Write a concise 2-3 sentence summary of what happened in this scene and the exact state at the end of the "
-        f"scene (character positions, held objects, physical/emotional state, and immediate unresolved tension) to serve "
-        f"as the continuity handoff into the next scene."
+        f"Write a strict, concrete 2-3 sentence PHYSICAL & SPATIAL STATE LEDGER at the exact end of this scene:\n"
+        f"- Sentence 1 (Location & Characters): Exact ending location and each present character's physical position, "
+        f"posture, and condition (e.g., standing, kneeling, collapsed, unconscious, slain, walking away, trailing behind).\n"
+        f"- Sentence 2 (Props & Trajectory): Exact weapons or objects currently held, dropped, or acquired by each character "
+        f"and their immediate physical trajectory entering the next scene.\n"
+        f"DO NOT include abstract emotional/thematic commentary or formulaic phrases like 'The immediate tension lies in...' "
+        f"or 'The emotional tone is...'."
     )
 
 
@@ -601,12 +649,17 @@ def _caption_one_scene(
     external_docs: List[Dict[str, Any]],
     prev_exit_state: str,
     prev_subtitles: List[Dict[str, Any]],
-    max_keyframes_per_scene: int = 15,
+    max_keyframes_per_scene: int = 30,
     max_image_width: int = 960,
+    min_keyframe_sharpness: float = 5.0,
 ) -> Tuple[str, str, List[str], Dict[str, int]]:
     """Run single-pass DeepSeek Vision API call for a Scene Window."""
     raw_kfs = scene.get("keyframes", [])
-    sampled_kfs = select_scene_keyframes(raw_kfs, max_frames=max_keyframes_per_scene)
+    sampled_kfs = select_scene_keyframes(
+        raw_kfs,
+        max_frames=max_keyframes_per_scene,
+        min_sharpness=min_keyframe_sharpness,
+    )
     kf_abs_paths = [resolve_kf_path(kf["path"]) for kf in sampled_kfs]
 
     act_context = _extract_time_matched_plot_context(
@@ -662,8 +715,9 @@ def run_single_scene_diagnostic(
     vlm_model_id: str = "deepseek-flash",
     api_key: Optional[str] = None,
     api_base_url: str = "https://api.deepseek.com",
-    max_keyframes_per_scene: int = 15,
+    max_keyframes_per_scene: int = 30,
     max_image_width: int = 960,
+    min_keyframe_sharpness: float = 5.0,
 ) -> Dict[str, Any]:
     """Run a single-scene diagnostic call on deepseek-flash to inspect caption quality and token usage."""
     shots_file = os.path.join(output_dir, "shots_and_scenes.json")
@@ -713,6 +767,7 @@ def run_single_scene_diagnostic(
         prev_subtitles=prev_subtitles,
         max_keyframes_per_scene=max_keyframes_per_scene,
         max_image_width=max_image_width,
+        min_keyframe_sharpness=min_keyframe_sharpness,
     )
     elapsed = time.perf_counter() - t0
 
@@ -746,14 +801,19 @@ def run_stage5_vlm_caption(
     vlm_model_id: str = "deepseek-flash",
     api_key: Optional[str] = None,
     api_base_url: str = "https://api.deepseek.com",
-    max_keyframes_per_scene: int = 15,
+    max_keyframes_per_scene: int = 30,
     max_image_width: int = 960,
+    min_keyframe_sharpness: float = 5.0,
+    credits_start_sec: Optional[Union[str, float, int]] = None,
     restart: bool = False,
 ) -> Dict[str, Any]:
-    """Run Single-Pass DeepSeek-Flash captioning across all Scene Windows and assemble the knowledge bundle."""
+    """Run Single-Pass DeepSeek-Flash captioning across all narrative Scene Windows and assemble the knowledge bundle."""
     shots_file = os.path.join(output_dir, "shots_and_scenes.json")
     if not os.path.isfile(shots_file):
         raise FileNotFoundError(f"shots_and_scenes.json not found: {shots_file}")
+
+    if credits_start_sec is not None:
+        apply_credits_cutoff_to_shots_file(shots_file, credits_start_sec)
 
     if restart:
         archived_files = archive_previous_vlm_outputs(output_dir)
@@ -763,12 +823,22 @@ def run_stage5_vlm_caption(
     with open(shots_file, "r", encoding="utf-8") as f:
         shots_and_scenes = json.load(f)
 
+    cutoff_sec = parse_timestamp_sec(credits_start_sec) or parse_timestamp_sec(shots_and_scenes.get("credits_start_sec"))
     movie_id = shots_and_scenes["movie_id"]
     resolved_title = movie_title or movie_id.replace("_", " ").title()
     resolved_franchise = franchise_id or movie_id
     fps = float(shots_and_scenes.get("fps") or 24.0)
     duration_sec = float(shots_and_scenes.get("duration_sec") or 0.0)
-    scenes = shots_and_scenes.get("scenes", [])
+    all_scenes = shots_and_scenes.get("scenes", [])
+    scenes = [
+        sc for sc in all_scenes
+        if not sc.get("is_credits", False) and (cutoff_sec is None or float(sc.get("start_time", 0.0)) < cutoff_sec)
+    ]
+    if len(scenes) < len(all_scenes):
+        print(
+            f"[Stage A5] Excluded {len(all_scenes) - len(scenes)} end-credit scene(s) "
+            f"(credits_start_sec={cutoff_sec}s); captioning {len(scenes)} narrative scenes."
+        )
     if not duration_sec and scenes:
         duration_sec = float(scenes[-1]["end_time"])
 
@@ -858,6 +928,7 @@ def run_stage5_vlm_caption(
                     prev_subtitles=prev_subtitles,
                     max_keyframes_per_scene=max_keyframes_per_scene,
                     max_image_width=max_image_width,
+                    min_keyframe_sharpness=min_keyframe_sharpness,
                 )
                 elapsed = time.perf_counter() - t0
                 total_prompt_tokens += usage["prompt_tokens"]
@@ -961,8 +1032,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--external_plot_file", default=None, help="Optional Tier-3 plot file")
     parser.add_argument("--vlm_model_id", default="deepseek-flash")
     parser.add_argument("--api_base_url", default="https://api.deepseek.com")
-    parser.add_argument("--max_keyframes_per_scene", type=int, default=15)
+    parser.add_argument("--max_keyframes_per_scene", type=int, default=30)
     parser.add_argument("--max_image_width", type=int, default=960)
+    parser.add_argument("--min_keyframe_sharpness", type=float, default=5.0)
+    parser.add_argument(
+        "--credits_start_sec",
+        default=None,
+        type=str,
+        help="Optional timestamp (e.g. '744.0' or '12:24') where closing credits start",
+    )
     parser.add_argument("--restart", action="store_true", help="Archive and ignore cached vlm_captions.jsonl")
     return parser.parse_args()
 
@@ -980,5 +1058,7 @@ if __name__ == "__main__":
         api_base_url=args.api_base_url,
         max_keyframes_per_scene=args.max_keyframes_per_scene,
         max_image_width=args.max_image_width,
+        min_keyframe_sharpness=args.min_keyframe_sharpness,
+        credits_start_sec=args.credits_start_sec,
         restart=args.restart,
     )
