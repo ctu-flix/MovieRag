@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
-"""Stage A3: Per-Shot Visual Tracking & Adaptive Annotated Keyframes (`stage3_visual_recog.py`).
+"""Stage A3: Per-Shot Visual Tracking & Motion-Adaptive Annotated Keyframes (`stage3_visual_recog.py`).
 
 1. Step 3.1 (Per-Shot TGRP Tracking):
    - Reads canonical `shots` from `shots_and_scenes.json` (where shots >20s are already subdivided).
-   - Decodes frames one shot at a time in small 32-frame chunks to a temporary folder and frees the
-     decoded frame buffer immediately before tracking begins.
-   - Samples 3 seed frames per shot, runs `google/owlv2-large-patch14-ensemble` (with NMS `iou=0.5`
-     and capped to top-5 character boxes per seed frame), prompts `SAM 2.1` (`sam2.1_hiera_l.yaml`)
-     under `torch.inference_mode()` + `bfloat16` autocast for bidirectional propagation, converts
-     mask logits to `[x1, y1, x2, y2]` directly on GPU (zero 2D masks in CPU RAM), and filters
-     tracks via tripartite graph matching (>=2 seed sets, IoU >= 0.5).
+   - Selects the 3 sharpest non-black seed frames per shot (1 per third via Laplacian variance),
+     runs `google/owlv2-large-patch14-ensemble` with expanded creature/warrior prompts and lower
+     `min_box_area_ratio=0.0015` (NMS `iou=0.5`, top-5 boxes per seed), prompts `SAM 2.1`
+     (`sam2.1_hiera_l.yaml`) under `torch.inference_mode()` + `bfloat16` autocast, converts mask
+     logits to `[x1, y1, x2, y2]` directly on GPU, and merges tracks with 1-seed high-confidence
+     rescue (`owl_score >= 0.20`) plus sliding-window carry-over across subdivided long takes.
    - Explicitly calls `inference_state.clear()` and `inference_state = None` BEFORE `gc.collect()`
-     and `torch.cuda.empty_cache()` after every shot so `inference_state["images"]` never leaks RAM.
+     and `torch.cuda.empty_cache()` after every shot so real cuts reset cleanly and RAM never leaks.
 2. Step 3.2 (DINOv2 Track Classification & Global Frame Mapping):
    - Samples up to 5 frames along each track, crops the character region, extracts features with
      the fine-tuned `DINOv2` model from Stage A2, and computes top-3 average cosine similarity
      $s_{\text{vm}}^p$ against each character in the bank.
-   - Retains labels with $s_{\text{vm}} > 0.45$ for visual prompting and marks $s_{\text{vm}} > 0.60$
-     for Stage A4 voice anchor harvesting.
+   - Retains labels with $s_{\text{vm}} > 0.45$ ($>= 0.55$ for single-seed rescued candidates) and
+     preserves carry-over identities across subdivided >20s take seams.
    - Writes `classified_tracks.json` and `visual_tracks_per_frame.json`.
-3. Step 3.3 (Adaptive Per-Shot Sharp Keyframe Extraction with Pre-Drawn Bounding Boxes):
-   - Short shots (<2.0s): selects 1 sharpest frame via OpenCV Variance of the Laplacian.
-   - Longer shots (>=2.0s): selects 1 sharpest frame per ~2.0s interval.
-   - Draws color-coded bounding boxes (`red`, `green`, `blue`, `yellow`, `pink`, `cyan`) for all
-     recognized characters ($s_{\text{vm}} > 0.45$) using a consistent per-scene color assignment.
-   - Saves annotated keyframes to `workdir/{movie_id}/keyframes/{scene_id}_shot{shot_idx}_{timestamp:06.2f}s.jpg`
-     and updates `shots_and_scenes.json` with `characters_present` and `keyframes`.
+3. Step 3.3 (Motion-Adaptive 2-6 fps Sharp Keyframe Extraction with Pre-Drawn Bounding Boxes):
+   - Probes shots at `max_action_fps` (default 6.0 fps), applies a strict Laplacian sharpness and
+     brightness floor (`min_sharpness_floor=10.0`), and retains 1.5-2.0 fps on static dialogue,
+     3-4 fps on moderate motion, and up to 6.0 fps on rapid cuts (<1.5s) / high action.
+   - Draws color-coded bounding boxes (`red`, `green`, `blue`, `yellow`, `pink`, `cyan`) on all
+     keyframes and partitions them across both `scene["keyframes"]` and `scene["micro_beats"]`.
 """
 
 from __future__ import annotations
@@ -244,6 +242,232 @@ def overlay_character_boxes_on_frame(
     return np.clip(blended, 0, 255).astype(np.uint8)
 
 
+def _select_sharpest_seed_frames(
+    shot_dir: str,
+    frame_names: List[str],
+    num_seeds: int = 3,
+    candidates_per_third: int = 5,
+) -> List[int]:
+    """Select the sharpest non-black seed frame inside each third of a shot."""
+    import cv2
+    import numpy as np
+
+    n = len(frame_names)
+    if n == 0:
+        return []
+    if n <= num_seeds:
+        return list(range(n))
+
+    selected: List[int] = []
+    for i in range(num_seeds):
+        t_s = (i * n) // num_seeds
+        t_e = ((i + 1) * n) // num_seeds if i < num_seeds - 1 else n
+        if t_e <= t_s:
+            continue
+
+        cand_raw = np.linspace(t_s, t_e - 1, min(candidates_per_third, t_e - t_s), dtype=int)
+        cand_idxs: List[int] = []
+        for idx_val in cand_raw.tolist():
+            if idx_val not in cand_idxs:
+                cand_idxs.append(int(idx_val))
+
+        scored: List[Tuple[int, float, float]] = []
+        for idx_val in cand_idxs:
+            img_bgr = cv2.imread(os.path.join(shot_dir, frame_names[idx_val]))
+            if img_bgr is None:
+                scored.append((idx_val, 0.0, 0.0))
+                continue
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            bright = float(gray.mean())
+            scored.append((idx_val, sharp, bright))
+
+        non_black = [item for item in scored if item[2] >= 4.0]
+        pool = non_black if non_black else scored
+        best_idx = max(pool, key=lambda item: item[1])[0]
+        if best_idx not in selected:
+            selected.append(best_idx)
+
+    return sorted(selected)
+
+
+def _nms_with_meta(
+    bboxes: np.ndarray,
+    scores: np.ndarray,
+    meta_list: List[Any],
+    iou_threshold: float = 0.5,
+) -> Tuple[List[Any], List[float], List[Any]]:
+    """Apply greedy IoU NMS while preserving parallel per-box metadata."""
+    import numpy as np
+    from tgrp import compute_iou
+
+    if len(bboxes) == 0:
+        return [], [], []
+
+    order = np.argsort(scores)[::-1].tolist()
+    kept_boxes: List[Any] = []
+    kept_scores: List[float] = []
+    kept_meta: List[Any] = []
+
+    while order:
+        cur = order[0]
+        cur_box = bboxes[cur]
+        kept_boxes.append(cur_box)
+        kept_scores.append(float(scores[cur]))
+        kept_meta.append(meta_list[cur])
+        order = [
+            idx for idx in order[1:]
+            if compute_iou(cur_box, bboxes[idx]) < iou_threshold
+        ]
+
+    return kept_boxes, kept_scores, kept_meta
+
+
+def merge_tracks_with_rescue(
+    track_results_per_shot: Dict[str, Dict[int, Dict[int, List[int]]]],
+    seed_scores_per_shot: Dict[str, Dict[int, float]],
+    shot_num_frames: int,
+    single_seed_rescue: bool = True,
+    single_seed_min_owl_score: float = 0.20,
+    single_seed_min_frame_ratio: float = 0.15,
+    carry_meta_per_obj: Optional[Dict[int, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Merge multi-seed TGRP tracks with carry-over continuity and 1-seed high-confidence rescue."""
+    from tgrp import (
+        build_track_graph,
+        compute_all_pairwise_matches,
+        compute_average_iou,
+        get_connected_components,
+        select_representative_tracks,
+        select_tracks_to_keep,
+    )
+
+    if not track_results_per_shot:
+        return []
+
+    frame_keys = sorted(
+        track_results_per_shot.keys(),
+        key=lambda k: (0 if k == "carry_0" else 1, int(k) if k.isdigit() else 0, k),
+    )
+
+    rare_track_sets: List[Dict[int, Dict[int, List[int]]]] = []
+    for f_key in frame_keys:
+        frame_data = track_results_per_shot[f_key]
+        track_set: Dict[int, Dict[int, List[int]]] = {}
+        for f_idx, item in frame_data.items():
+            for track_id, bbox in item.items():
+                track_set.setdefault(track_id, {})[int(f_idx)] = bbox
+        rare_track_sets.append(track_set)
+
+    global_tracks: Dict[str, Dict[str, Any]] = {}
+    for s_idx, track_set in enumerate(rare_track_sets):
+        for track_id, trk in track_set.items():
+            global_tracks[f"set{s_idx}_{track_id}"] = {
+                "set_idx": s_idx,
+                "track_id": track_id,
+                "track": trk,
+            }
+
+    matches = compute_all_pairwise_matches(rare_track_sets, iou_threshold=0.5)
+    G = build_track_graph(matches)
+    connected_components = get_connected_components(G)
+    tracks_to_keep = select_tracks_to_keep(connected_components, global_tracks)
+    rep_tracks = select_representative_tracks(tracks_to_keep, rare_track_sets)
+
+    matched_pairs_in_multi: Set[Tuple[int, Any]] = set()
+    kept_entries: List[Dict[str, Any]] = []
+
+    for group, rep in zip(tracks_to_keep, rep_tracks):
+        peak_owl = 0.0
+        carried_prev_id = None
+        has_carry = False
+        for s_idx, tid in group:
+            matched_pairs_in_multi.add((s_idx, tid))
+            f_key = frame_keys[s_idx]
+            peak_owl = max(peak_owl, float(seed_scores_per_shot.get(f_key, {}).get(tid, 0.0)))
+            if f_key == "carry_0" and carry_meta_per_obj and tid in carry_meta_per_obj:
+                has_carry = True
+                carried_prev_id = carry_meta_per_obj[tid].get("prev_track_id")
+
+        entry: Dict[str, Any] = {
+            "track_id": rep["track_id"],
+            "set_idx": rep["set_idx"],
+            "track": rep["track"],
+            "owl_score": round(float(peak_owl), 4),
+            "single_seed_candidate": False,
+            "carried_from_prev_subshot": has_carry,
+        }
+        if carried_prev_id is not None:
+            entry["carried_prev_track_id"] = carried_prev_id
+        kept_entries.append(entry)
+
+    # Candidate pool for carry-over rescue and 1-seed high-confidence rescue
+    orphan_candidates: List[Tuple[int, int, str, Any, Dict[int, List[int]], float]] = []
+    for s_idx, track_set in enumerate(rare_track_sets):
+        f_key = frame_keys[s_idx]
+        is_carry = f_key == "carry_0"
+        for track_id, cand_track in track_set.items():
+            if (s_idx, track_id) in matched_pairs_in_multi:
+                continue
+            owl_sc = float(seed_scores_per_shot.get(f_key, {}).get(track_id, 0.25 if is_carry else 0.0))
+            orphan_candidates.append((0 if is_carry else 1, s_idx, f_key, track_id, cand_track, owl_sc))
+
+    # Process carry_0 first, then highest OWLv2 confidence + longest tracks
+    orphan_candidates.sort(key=lambda item: (item[0], -item[5], -len(item[4])))
+
+    for is_non_carry, s_idx, f_key, track_id, cand_track, owl_sc in orphan_candidates:
+        is_carry = is_non_carry == 0
+        min_frames = max(2, min(3 if is_carry else 4, shot_num_frames))
+        min_ratio = 0.08 if is_carry else single_seed_min_frame_ratio
+        if len(cand_track) < min_frames:
+            continue
+        if (len(cand_track) / float(max(1, shot_num_frames))) < min_ratio:
+            continue
+
+        overlapping_kept = None
+        for kept in kept_entries:
+            if compute_average_iou(cand_track, kept["track"]) >= 0.5:
+                overlapping_kept = kept
+                break
+
+        if overlapping_kept is not None:
+            if is_carry and carry_meta_per_obj and track_id in carry_meta_per_obj:
+                overlapping_kept["carried_from_prev_subshot"] = True
+                overlapping_kept["carried_prev_track_id"] = carry_meta_per_obj[track_id].get("prev_track_id")
+            continue
+
+        if is_carry:
+            carry_entry: Dict[str, Any] = {
+                "track_id": track_id,
+                "set_idx": s_idx,
+                "track": cand_track,
+                "owl_score": round(float(owl_sc), 4),
+                "single_seed_candidate": False,
+                "carried_from_prev_subshot": True,
+            }
+            if carry_meta_per_obj and track_id in carry_meta_per_obj:
+                carry_entry["carried_prev_track_id"] = carry_meta_per_obj[track_id].get("prev_track_id")
+            kept_entries.append(carry_entry)
+        elif single_seed_rescue and owl_sc >= single_seed_min_owl_score:
+            kept_entries.append(
+                {
+                    "track_id": track_id,
+                    "set_idx": s_idx,
+                    "track": cand_track,
+                    "owl_score": round(float(owl_sc), 4),
+                    "single_seed_candidate": True,
+                    "carried_from_prev_subshot": False,
+                }
+            )
+
+    serializable_tracks: List[Dict[str, Any]] = []
+    for trk in kept_entries:
+        trk_copy = dict(trk)
+        trk_copy["track"] = {str(frame_idx): bbox for frame_idx, bbox in sorted(trk["track"].items())}
+        serializable_tracks.append(trk_copy)
+    return serializable_tracks
+
+
 def run_per_shot_tgrp(
     video_path: str,
     movie_id: str,
@@ -251,10 +475,12 @@ def run_per_shot_tgrp(
     tgrp_jsonl_path: str,
     sam2_checkpoint: str,
     max_boxes_per_seed: int = 5,
-    min_box_area_ratio: float = 0.005,
+    min_box_area_ratio: float = 0.0015,
+    single_seed_rescue: bool = True,
+    single_seed_min_owl_score: float = 0.20,
     restart: bool = False,
 ) -> str:
-    """Run OWLv2 + SAM 2.1 bidirectional tracking + tripartite matching per shot with JSONL resume."""
+    """Run OWLv2 + SAM 2.1 bidirectional tracking + rescued tripartite matching per shot with JSONL resume."""
     import cv2
     import numpy as np
     import PIL.Image as Image
@@ -263,7 +489,6 @@ def run_per_shot_tgrp(
     from tgrp import (
         box_area,
         load_completed_shots,
-        merge_tracks,
         non_max_suppression,
     )
     from transformers import Owlv2ForObjectDetection, Owlv2Processor
@@ -308,6 +533,21 @@ def run_per_shot_tgrp(
     completed_map = load_completed_shots(tgrp_jsonl_path)
     done_shot_ids: Set[int] = completed_map.get(movie_id, set())
 
+    # Load prior completed shot records so resumed runs still support sliding-window carry-over
+    completed_records_by_shot: Dict[int, Dict[str, Any]] = {}
+    if os.path.isfile(tgrp_jsonl_path):
+        with open(tgrp_jsonl_path, "r", encoding="utf-8") as prev_f:
+            for line in prev_f:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                    if rec.get("video_idx") == movie_id and "shot_idx" in rec:
+                        completed_records_by_shot[int(rec["shot_idx"])] = rec
+                except json.JSONDecodeError:
+                    continue
+
+    shots_by_id: Dict[int, Dict[str, Any]] = {int(s["shot_idx"]): s for s in shots}
     pending_shots = [s for s in shots if int(s["shot_idx"]) not in done_shot_ids]
     if not pending_shots:
         print(f"[Stage A3.1] All {len(shots)} shots already present in {tgrp_jsonl_path}; skipping TGRP.")
@@ -328,7 +568,7 @@ def run_per_shot_tgrp(
     processor = Owlv2Processor.from_pretrained(owlv2_source)
     owlv2_model = Owlv2ForObjectDetection.from_pretrained(owlv2_source).to(device)
     owlv2_model.eval()
-    texts = [["a photo of an animated character"]]
+    texts = [["a photo of an animated character", "a dragon or creature", "a person or warrior"]]
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(_silence_sam2_tqdm())
@@ -358,6 +598,9 @@ def run_per_shot_tgrp(
                 end_frame = max(0, min(int(shot["end_frame"]), total_frames))
                 if start_frame >= end_frame:
                     continue
+
+                parent_shot_idx = int(shot.get("parent_shot_idx", shot_id))
+                is_sub_cont = bool(shot.get("is_subdivided_continuation", False))
 
                 shot_t0 = time.perf_counter()
                 shot_frames_n = 0
@@ -394,21 +637,23 @@ def run_per_shot_tgrp(
                         save_shot_results: Dict[str, Any] = {
                             "video_idx": movie_id,
                             "shot_idx": shot_id,
+                            "parent_shot_idx": parent_shot_idx,
+                            "is_subdivided_continuation": is_sub_cont,
                             "start_idx": int(start_frame),
                             "end_idx": int(end_frame - 1),
                         }
 
-                        rng = random.Random(f"{movie_id}:{shot_id}")
-                        if n < 3:
-                            key_frame_idx = rng.sample(range(n), n)
-                        else:
-                            division_size = n // 3
-                            key_frame_idx = [
-                                rng.choice(range(i * division_size, (i + 1) * division_size))
-                                for i in range(3)
-                            ]
+                        # 3 sharpest non-black seeds (1 per third of shot) instead of random frames
+                        key_frame_idx = _select_sharpest_seed_frames(
+                            shot_dir=shot_dir,
+                            frame_names=frame_names,
+                            num_seeds=3,
+                            candidates_per_third=5,
+                        )
 
                         key_frame_detection_results: Dict[str, Any] = {}
+                        seed_scores_per_shot: Dict[str, Dict[int, float]] = {}
+
                         for local_f_idx in key_frame_idx:
                             img_path = os.path.join(shot_dir, frame_names[local_f_idx])
                             image = Image.open(img_path).convert("RGB")
@@ -454,10 +699,69 @@ def run_per_shot_tgrp(
                                 selected_bboxes = selected_bboxes[:max_boxes_per_seed]
                                 selected_scores = selected_scores[:max_boxes_per_seed]
 
-                            key_frame_detection_results[str(local_f_idx)] = {
+                            f_key = str(local_f_idx)
+                            key_frame_detection_results[f_key] = {
                                 "bbox": selected_bboxes,
                                 "bbox_scores": selected_scores,
+                                "ann_frame_idx": int(local_f_idx),
                             }
+                            seed_scores_per_shot[f_key] = {
+                                obj_i: float(sc) for obj_i, sc in enumerate(selected_scores)
+                            }
+
+                        # Sliding-window carry-over STRICTLY on subdivided continuations of the same raw take
+                        carry_meta_per_obj: Optional[Dict[int, Dict[str, Any]]] = None
+                        prev_shot = shots_by_id.get(shot_id - 1)
+                        prev_rec = completed_records_by_shot.get(shot_id - 1)
+                        if (
+                            is_sub_cont
+                            and prev_shot is not None
+                            and prev_rec is not None
+                            and int(prev_shot.get("parent_shot_idx", -1)) == parent_shot_idx
+                            and int(prev_shot["end_frame"]) == start_frame
+                        ):
+                            prev_n = int(prev_rec["end_idx"]) - int(prev_rec["start_idx"]) + 1
+                            tail_keys = [str(f_i) for f_i in (prev_n - 1, prev_n - 2) if f_i >= 0]
+                            raw_carry_boxes: List[List[float]] = []
+                            raw_carry_scores: List[float] = []
+                            raw_carry_meta: List[Dict[str, Any]] = []
+                            for prev_trk in prev_rec.get("tracks", []):
+                                prev_owl = float(prev_trk.get("owl_score", 0.25))
+                                if prev_trk.get("single_seed_candidate", False) and prev_owl < single_seed_min_owl_score:
+                                    continue
+                                trk_dict = prev_trk.get("track", {})
+                                chosen_bbox = None
+                                for tk in tail_keys:
+                                    if tk in trk_dict:
+                                        chosen_bbox = trk_dict[tk]
+                                        break
+                                if chosen_bbox is not None:
+                                    raw_carry_boxes.append([float(c) for c in chosen_bbox])
+                                    raw_carry_scores.append(max(prev_owl, 0.25))
+                                    raw_carry_meta.append({"prev_track_id": prev_trk.get("track_id")})
+
+                            if raw_carry_boxes:
+                                k_boxes, k_scores, k_meta = _nms_with_meta(
+                                    np.array(raw_carry_boxes, dtype=np.float32),
+                                    np.array(raw_carry_scores, dtype=np.float32),
+                                    raw_carry_meta,
+                                    iou_threshold=0.5,
+                                )
+                                if len(k_boxes) > max_boxes_per_seed:
+                                    k_boxes = k_boxes[:max_boxes_per_seed]
+                                    k_scores = k_scores[:max_boxes_per_seed]
+                                    k_meta = k_meta[:max_boxes_per_seed]
+                                key_frame_detection_results["carry_0"] = {
+                                    "bbox": k_boxes,
+                                    "bbox_scores": k_scores,
+                                    "ann_frame_idx": 0,
+                                }
+                                seed_scores_per_shot["carry_0"] = {
+                                    obj_i: float(sc) for obj_i, sc in enumerate(k_scores)
+                                }
+                                carry_meta_per_obj = {
+                                    obj_i: meta for obj_i, meta in enumerate(k_meta)
+                                }
 
                         track_results_per_shot: Dict[str, Any] = {}
                         if key_frame_detection_results:
@@ -466,17 +770,16 @@ def run_per_shot_tgrp(
                                 dtype=autocast_dtype,
                                 enabled=use_autocast,
                             ):
-                                # offload_video_to_cpu=True + offload_state_to_cpu=False keeps VRAM low,
-                                # and we explicitly clear inference_state["images"] + trim heap in finally!
+                                # offload_video_to_cpu=True keeps VRAM low; always reset between shots
                                 inference_state = video_predictor.init_state(
                                     video_path=shot_dir,
                                     offload_video_to_cpu=True,
                                 )
 
                                 for frame_idx_str, anns in key_frame_detection_results.items():
-                                    ann_frame_idx = int(frame_idx_str)
+                                    ann_frame_idx = int(anns.get("ann_frame_idx", frame_idx_str))
                                     boxes = anns["bbox"]
-                                    if not boxes:
+                                    if len(boxes) == 0:
                                         continue
 
                                     for obj_i, box in enumerate(boxes):
@@ -514,13 +817,25 @@ def run_per_shot_tgrp(
                                     video_predictor.reset_state(inference_state)
                                     track_results_per_shot[frame_idx_str] = dict(sorted(video_segments.items()))
 
-                            track_results = merge_tracks(track_results_per_shot) if track_results_per_shot else []
+                            track_results = (
+                                merge_tracks_with_rescue(
+                                    track_results_per_shot=track_results_per_shot,
+                                    seed_scores_per_shot=seed_scores_per_shot,
+                                    shot_num_frames=n,
+                                    single_seed_rescue=single_seed_rescue,
+                                    single_seed_min_owl_score=single_seed_min_owl_score,
+                                    carry_meta_per_obj=carry_meta_per_obj,
+                                )
+                                if track_results_per_shot
+                                else []
+                            )
                         else:
                             track_results = []
 
                         save_shot_results["tracks"] = track_results
                         out_f.write(json.dumps(save_shot_results) + "\n")
                         out_f.flush()
+                        completed_records_by_shot[shot_id] = save_shot_results
                         shot_tracks_n = len(track_results)
                         shot_succeeded = True
                         completed_count += 1
@@ -572,8 +887,9 @@ def classify_tracks_and_map_frames(
     sam2_checkpoint: Optional[str] = None,
     visual_prompt_thresh: float = 0.45,
     voice_harvest_thresh: float = 0.60,
+    single_seed_dino_thresh: float = 0.55,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Classify TGRP tracks with fine-tuned DINOv2 and map to global movie frames."""
+    """Classify TGRP tracks with fine-tuned DINOv2, enforce single-seed/carry-over rules, and map to global frames."""
     import numpy as np
     import PIL.Image as Image
     import torch
@@ -631,15 +947,19 @@ def classify_tracks_and_map_frames(
 
     classified_shot_records: List[Dict[str, Any]] = []
     frames_predictions: Dict[str, Dict[str, List[Any]]] = {}
+    prev_subshot_track_labels: Dict[Tuple[int, Any], Tuple[str, float]] = {}
 
     total_tracks_count = 0
     vp_valid_tracks_count = 0
     voice_valid_tracks_count = 0
+    single_seed_rescued_count = 0
+    carry_preserved_count = 0
 
     k = 5
     for shot_record in tqdm(unclassified_shots, desc="DINOv2 Track Classification"):
         shot_idx = int(shot_record["shot_idx"])
         shot_start_idx = int(shot_record["start_idx"])
+        is_sub_cont = bool(shot_record.get("is_subdivided_continuation", False))
         classified_tracks: List[Dict[str, Any]] = []
 
         for unclassified_track in shot_record.get("tracks", []):
@@ -707,20 +1027,49 @@ def classify_tracks_and_map_frames(
 
             best_char = max(char_best_scores.items(), key=lambda item: item[1])[0]
             max_score = round(float(char_best_scores[best_char]), 4)
-            is_vp_valid = max_score > visual_prompt_thresh
+
+            carried_label = None
+            is_carried = bool(unclassified_track.get("carried_from_prev_subshot", False))
+            if is_sub_cont and is_carried:
+                prev_tid = unclassified_track.get("carried_prev_track_id")
+                prev_info = prev_subshot_track_labels.get((shot_idx - 1, prev_tid))
+                if prev_info is not None:
+                    prev_label, prev_score = prev_info
+                    carried_char_score = float(char_best_scores.get(prev_label, 0.0))
+                    # Preserve identity continuity across subdivided seams unless DINOv2 confidence collapses
+                    if carried_char_score >= 0.30 and (max_score - carried_char_score) < 0.20:
+                        best_char = prev_label
+                        carried_label = prev_label
+                        max_score = round(max(max_score, carried_char_score, min(prev_score, 0.52)), 4)
+                        carry_preserved_count += 1
+
+            is_single_seed = bool(unclassified_track.get("single_seed_candidate", False)) and not is_carried
+            if is_single_seed:
+                is_vp_valid = max_score >= single_seed_dino_thresh
+            else:
+                is_vp_valid = max_score > visual_prompt_thresh
             is_voice_valid = max_score > voice_harvest_thresh
 
             if is_vp_valid:
                 vp_valid_tracks_count += 1
+                if is_single_seed:
+                    single_seed_rescued_count += 1
+                prev_subshot_track_labels[(shot_idx, unclassified_track.get("track_id"))] = (best_char, max_score)
             if is_voice_valid:
                 voice_valid_tracks_count += 1
 
             classified_track = copy.deepcopy(unclassified_track)
             classified_track["label"] = best_char
             classified_track["score"] = max_score
+            if carried_label is not None:
+                classified_track["carried_label"] = carried_label
             classified_track["is_visual_prompt_valid"] = is_vp_valid
             classified_track["is_voice_anchor_valid"] = is_voice_valid
             classified_tracks.append(classified_track)
+
+            # Single-seed candidates only enter frame predictions if they clear the stricter DINOv2 threshold
+            if is_single_seed and not is_vp_valid:
+                continue
 
             for local_f_str, bbox in frame_bbox_dict.items():
                 global_f_idx = shot_start_idx + int(local_f_str)
@@ -753,9 +1102,12 @@ def classify_tracks_and_map_frames(
         "fps": round(fps, 4),
         "visual_prompt_thresh": visual_prompt_thresh,
         "voice_harvest_thresh": voice_harvest_thresh,
+        "single_seed_dino_thresh": single_seed_dino_thresh,
         "stats": {
             "total_tracks": total_tracks_count,
             "visual_prompt_tracks": vp_valid_tracks_count,
+            "single_seed_rescued_tracks": single_seed_rescued_count,
+            "carry_preserved_tracks": carry_preserved_count,
             "voice_anchor_tracks": voice_valid_tracks_count,
             "frames_with_detections": len(frames_predictions),
         },
@@ -767,7 +1119,9 @@ def classify_tracks_and_map_frames(
 
     print(
         f"[Stage A3.2] Classified {total_tracks_count} tracks "
-        f"({vp_valid_tracks_count} > {visual_prompt_thresh} for VLM prompting, "
+        f"({vp_valid_tracks_count} > {visual_prompt_thresh} for VLM prompting "
+        f"[incl. {single_seed_rescued_count} 1-seed rescued >= {single_seed_dino_thresh}, "
+        f"{carry_preserved_count} carry-preserved], "
         f"{voice_valid_tracks_count} > {voice_harvest_thresh} for voice harvesting)."
     )
     print(f"[Stage A3.2] Saved frame-level visual tracks to: {visual_tracks_path}")
@@ -781,17 +1135,22 @@ def extract_adaptive_annotated_keyframes(
     frames_predictions: Dict[str, Dict[str, List[Any]]],
     output_dir: str,
     visual_prompt_thresh: float = 0.45,
-    short_shot_sec: float = 1.0,
+    base_fps: float = 2.0,
+    max_action_fps: float = 6.0,
+    low_motion_thresh: float = 4.0,
+    high_motion_thresh: float = 12.0,
+    short_shot_sec: float = 1.5,
     interval_sec: float = 1.0,
-    max_keyframes_per_scene: int = 30,
+    max_keyframes_per_scene: int = 150,
     min_sharpness_floor: float = 10.0,
     pinned_timestamps: Optional[Dict[str, List[float]]] = None,
 ) -> Dict[str, Any]:
-    """Extract adaptive sharp + motion-aware per-shot keyframes (up to 30/scene) and draw character boxes."""
+    """Extract motion-adaptive 2-6 fps sharp keyframes with drawn character boxes and attach to micro-beats."""
     import cv2
     import numpy as np
     from decord import VideoReader, cpu
     from tqdm import tqdm
+    from pipeline.stage1_scenes import build_micro_beats
 
     vr = VideoReader(video_path, ctx=cpu(0))
     total_frames = len(vr)
@@ -809,7 +1168,13 @@ def extract_adaptive_annotated_keyframes(
                 return int(sh["shot_idx"])
         return int(scene_shots[-1]["shot_idx"]) if scene_shots else 0
 
-    for scene_counter, scene in enumerate(tqdm(shots_and_scenes.get("scenes", []), desc="Adaptive Annotated Keyframes")):
+    probe_step = max(1, int(round(fps / max(1.0, max_action_fps))))
+    dt_high_sec = 0.85 / max(1.0, max_action_fps)
+    mid_fps = max(base_fps, 0.5 * (base_fps + max_action_fps))
+    dt_mid_sec = 0.90 / max(1.0, mid_fps)
+    dt_low_sec = 0.95 / max(0.5, base_fps)
+
+    for scene_counter, scene in enumerate(tqdm(shots_and_scenes.get("scenes", []), desc="Motion-Adaptive 2-6fps Keyframes")):
         if scene_counter > 0 and scene_counter % 5 == 0:
             del vr
             _trim_host_memory()
@@ -818,6 +1183,8 @@ def extract_adaptive_annotated_keyframes(
         if scene.get("is_credits", False):
             scene["characters_present"] = []
             scene["keyframes"] = []
+            for mb in scene.get("micro_beats", []):
+                mb["keyframes"] = []
             continue
 
         # Remove any stale keyframe files for this scene before writing fresh ones
@@ -871,9 +1238,11 @@ def extract_adaptive_annotated_keyframes(
             )
 
         scene["characters_present"] = characters_present_list
-        raw_candidates: List[Dict[str, Any]] = []
         scene_shots = scene.get("shot_ranges", [])
+        if not scene.get("micro_beats"):
+            scene["micro_beats"] = build_micro_beats(scene_id=scene_id, shot_ranges=scene_shots, fps=fps)
 
+        raw_candidates: List[Dict[str, Any]] = []
         for shot in scene_shots:
             shot_idx = int(shot["shot_idx"])
             s_frame = max(0, min(int(shot["start_frame"]), total_frames))
@@ -882,116 +1251,113 @@ def extract_adaptive_annotated_keyframes(
                 continue
 
             shot_dur = (e_frame - s_frame) / fps
-            if shot_dur < short_shot_sec:
-                intervals = [(s_frame, e_frame)]
-            else:
-                num_intervals = max(1, int(round(shot_dur / interval_sec)))
-                step = (e_frame - s_frame) / float(num_intervals)
-                intervals = []
-                for i in range(num_intervals):
-                    int_s = int(round(s_frame + i * step))
-                    int_e = int(round(s_frame + (i + 1) * step)) if i < num_intervals - 1 else e_frame
-                    if int_s < int_e:
-                        intervals.append((int_s, int_e))
+            probe_indices = list(range(s_frame, e_frame, probe_step))
+            if (e_frame - 1) not in probe_indices:
+                probe_indices.append(e_frame - 1)
 
-            for int_s, int_e in intervals:
-                full_range = list(range(int_s, int_e))
-                if not full_range:
-                    continue
+            probe_metrics: List[Dict[str, Any]] = []
+            prev_gray: Optional[np.ndarray] = None
+            cached_small_rgb: Dict[int, np.ndarray] = {}
+            keep_rgb_inline = len(probe_indices) <= 32
 
-                # Evenly sample up to 12 frames across the full interval PLUS up to 4 frames with detections
-                if len(full_range) > 12:
-                    even_idxs = np.linspace(0, len(full_range) - 1, 12, dtype=int)
-                    sampled_set = {full_range[i] for i in even_idxs}
-                else:
-                    sampled_set = set(full_range)
-
-                frames_with_chars = [
-                    f_i
-                    for f_i in full_range
-                    if any(
-                        float(sc) > visual_prompt_thresh
-                        for sc in frames_predictions.get(str(f_i), {}).get("scores", [])
-                    )
-                ]
-                if frames_with_chars:
-                    char_idxs = np.linspace(0, len(frames_with_chars) - 1, min(4, len(frames_with_chars)), dtype=int)
-                    for ci in char_idxs:
-                        sampled_set.add(frames_with_chars[ci])
-
-                candidate_pool = sorted(sampled_set)
-                decoded_candidates = vr.get_batch(candidate_pool).asnumpy()
-
-                cand_metrics: List[Dict[str, Any]] = []
-                prev_gray: Optional[np.ndarray] = None
-
-                for cand_f_idx, cand_rgb in zip(candidate_pool, decoded_candidates):
+            for c_start in range(0, len(probe_indices), 32):
+                chunk_idxs = probe_indices[c_start : c_start + 32]
+                decoded_chunk = vr.get_batch(chunk_idxs).asnumpy()
+                for cand_f_idx, cand_rgb in zip(chunk_idxs, decoded_chunk):
                     gray = cv2.cvtColor(cand_rgb, cv2.COLOR_RGB2GRAY)
                     sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
                     brightness = float(gray.mean())
                     if prev_gray is not None:
-                        motion_delta = float(np.mean(np.abs(gray.astype(np.float32) - prev_gray.astype(np.float32))))
+                        motion_delta = float(
+                            np.mean(np.abs(gray.astype(np.float32) - prev_gray.astype(np.float32)))
+                        )
                     else:
                         motion_delta = 0.0
                     prev_gray = gray
 
-                    f_scores = [
-                        float(sc)
-                        for sc in frames_predictions.get(str(cand_f_idx), {}).get("scores", [])
-                        if float(sc) > visual_prompt_thresh
-                    ]
-                    max_char_sc = max(f_scores) if f_scores else 0.0
-
-                    cand_metrics.append(
+                    probe_metrics.append(
                         {
                             "frame_idx": int(cand_f_idx),
-                            "rgb": cand_rgb,
                             "sharpness": sharpness,
                             "brightness": brightness,
                             "motion_delta": motion_delta,
-                            "char_score": max_char_sc,
                         }
                     )
+                    if keep_rgb_inline:
+                        cached_small_rgb[int(cand_f_idx)] = cand_rgb.copy()
+                del decoded_chunk
 
-                max_sharp = max(m["sharpness"] for m in cand_metrics)
-                max_motion = max((m["motion_delta"] for m in cand_metrics), default=0.0)
-                sharp_cutoff = max(min_sharpness_floor, 0.40 * max_sharp)
+            # Sharpness & black-fade guard
+            sharp_pool = [
+                m for m in probe_metrics
+                if m["sharpness"] >= min_sharpness_floor and m["brightness"] >= 3.5
+            ]
+            if not sharp_pool and probe_metrics:
+                top_fallback = sorted(
+                    probe_metrics,
+                    key=lambda m: (1 if m["brightness"] >= 3.5 else 0, m["sharpness"]),
+                    reverse=True,
+                )[: min(3, len(probe_metrics))]
+                sharp_pool = sorted(top_fallback, key=lambda m: m["frame_idx"])
 
-                # Step A: Filter out blurry or pure-black fade frames first
-                sharp_pool = [
-                    m for m in cand_metrics
-                    if m["sharpness"] >= sharp_cutoff and m["brightness"] >= 3.5
-                ]
-                if not sharp_pool:
-                    sharp_pool = [max(cand_metrics, key=lambda m: m["sharpness"])]
+            # Motion-adaptive temporal retention (always keep first & last sharp frame per shot)
+            if len(sharp_pool) <= 2:
+                kept_shot_frames = sharp_pool
+            else:
+                kept_shot_frames = [sharp_pool[0]]
+                last_kept = sharp_pool[0]
+                last_sharp = sharp_pool[-1]
+                for m in sharp_pool[1:-1]:
+                    if shot_dur < short_shot_sec or m["motion_delta"] >= high_motion_thresh:
+                        min_dt_sec = dt_high_sec
+                    elif m["motion_delta"] >= low_motion_thresh:
+                        min_dt_sec = dt_mid_sec
+                    else:
+                        min_dt_sec = dt_low_sec
 
-                # Step B: Rank sharp candidates by sharpness + visual-change peak + character presence
-                def _score_candidate(m: Dict[str, Any]) -> float:
-                    norm_sharp = m["sharpness"] / max(max_sharp, 1.0)
-                    norm_motion = (m["motion_delta"] / max(max_motion, 1.0)) if max_motion > 1.5 else 0.0
-                    char_bonus = 0.20 if m["char_score"] > visual_prompt_thresh else 0.0
-                    return 0.45 * norm_sharp + 0.35 * norm_motion + char_bonus
+                    elapsed_since_last = (m["frame_idx"] - last_kept["frame_idx"]) / fps
+                    gap_before_end = (last_sharp["frame_idx"] - m["frame_idx"]) / fps
+                    if elapsed_since_last >= min_dt_sec and gap_before_end >= (0.45 * min_dt_sec):
+                        kept_shot_frames.append(m)
+                        last_kept = m
+                kept_shot_frames.append(last_sharp)
 
-                best_cand = max(sharp_pool, key=_score_candidate)
-                raw_candidates.append(
-                    {
-                        "shot_idx": shot_idx,
-                        "frame_idx": best_cand["frame_idx"],
-                        "rgb": best_cand["rgb"].copy(),
-                        "sharpness": best_cand["sharpness"],
-                        "motion_delta": best_cand["motion_delta"],
-                        "pinned": False,
-                    }
-                )
-                del decoded_candidates, cand_metrics, sharp_pool
+            if keep_rgb_inline:
+                for m in kept_shot_frames:
+                    raw_candidates.append(
+                        {
+                            "shot_idx": shot_idx,
+                            "frame_idx": int(m["frame_idx"]),
+                            "rgb": cached_small_rgb[int(m["frame_idx"])],
+                            "sharpness": float(m["sharpness"]),
+                            "motion_delta": float(m["motion_delta"]),
+                            "pinned": False,
+                        }
+                    )
+                cached_small_rgb.clear()
+            elif kept_shot_frames:
+                kept_f_idxs = [int(m["frame_idx"]) for m in kept_shot_frames]
+                kept_decoded = vr.get_batch(kept_f_idxs).asnumpy()
+                for m, rgb_arr in zip(kept_shot_frames, kept_decoded):
+                    raw_candidates.append(
+                        {
+                            "shot_idx": shot_idx,
+                            "frame_idx": int(m["frame_idx"]),
+                            "rgb": rgb_arr.copy(),
+                            "sharpness": float(m["sharpness"]),
+                            "motion_delta": float(m["motion_delta"]),
+                            "pinned": False,
+                        }
+                    )
+                del kept_decoded
 
         # Optional: Force-include human-pinned timestamps for this scene
         scene_pins = pinned_map.get(scene_id, [])
         for pin_sec in scene_pins:
             pin_f = max(scene_start_f, min(int(round(float(pin_sec) * fps)), scene_end_f - 1))
-            if any(abs(c["frame_idx"] - pin_f) <= max(1, int(round(0.35 * fps))) for c in raw_candidates):
+            if any(abs(c["frame_idx"] - pin_f) <= max(1, int(round(0.25 * fps))) for c in raw_candidates):
                 for c in raw_candidates:
-                    if abs(c["frame_idx"] - pin_f) <= max(1, int(round(0.35 * fps))):
+                    if abs(c["frame_idx"] - pin_f) <= max(1, int(round(0.25 * fps))):
                         c["pinned"] = True
                 continue
             pin_rgb = vr.get_batch([pin_f]).asnumpy()[0].copy()
@@ -1010,7 +1376,7 @@ def extract_adaptive_annotated_keyframes(
 
         raw_candidates.sort(key=lambda c: c["frame_idx"])
 
-        # Cap at max_keyframes_per_scene (default 30) while preserving pinned frames and temporal coverage
+        # Cap at max_keyframes_per_scene while preserving pinned frames and temporal coverage
         if max_keyframes_per_scene > 0 and len(raw_candidates) > max_keyframes_per_scene:
             pinned_only = [c for c in raw_candidates if c.get("pinned")]
             unpinned = [c for c in raw_candidates if not c.get("pinned")]
@@ -1076,6 +1442,7 @@ def extract_adaptive_annotated_keyframes(
                 "frame_idx": best_frame_idx,
                 "timestamp": timestamp_sec,
                 "sharpness": round(best_sharpness, 2),
+                "motion_delta": round(float(cand.get("motion_delta", 0.0)), 2),
                 "path": kf_rel_path,
                 "characters_visible": characters_visible_meta,
             }
@@ -1086,6 +1453,30 @@ def extract_adaptive_annotated_keyframes(
         del raw_candidates, selected_candidates
         scene["keyframes"] = scene_keyframes
 
+        # Partition scene keyframes into each 4-10s micro-beat
+        char_info_map = {cp["name"]: cp for cp in characters_present_list}
+        micro_beats = scene.get("micro_beats", [])
+        for b_i, mb in enumerate(micro_beats):
+            b_sf = int(mb["start_frame"])
+            b_ef = int(mb["end_frame"])
+            is_last_b = b_i == len(micro_beats) - 1
+            mb_kfs = [
+                kf for kf in scene_keyframes
+                if (
+                    b_sf <= int(kf["frame_idx"]) <= b_ef
+                    if is_last_b
+                    else b_sf <= int(kf["frame_idx"]) < b_ef
+                )
+            ]
+            mb["keyframes"] = mb_kfs
+            mb_char_names: List[str] = []
+            for kf in mb_kfs:
+                for cv_item in kf.get("characters_visible", []):
+                    cname = cv_item.get("name")
+                    if cname and cname not in mb_char_names:
+                        mb_char_names.append(cname)
+            mb["characters_present"] = [char_info_map[cname] for cname in mb_char_names if cname in char_info_map]
+
     del vr
     _trim_host_memory()
     shots_and_scenes["total_keyframes"] = total_keyframes_saved
@@ -1094,7 +1485,7 @@ def extract_adaptive_annotated_keyframes(
         json.dump(shots_and_scenes, f, indent=2)
 
     print(
-        f"[Stage A3.3] Extracted & annotated {total_keyframes_saved} adaptive shot-keyframes "
+        f"[Stage A3.3] Extracted & annotated {total_keyframes_saved} motion-adaptive (2-6 fps) keyframes "
         f"into {keyframes_dir} and updated {shots_path}."
     )
     return shots_and_scenes
@@ -1105,14 +1496,18 @@ def reextract_keyframes_only(
     shots_file: str,
     output_dir: str,
     visual_prompt_thresh: float = 0.45,
-    short_shot_sec: float = 1.0,
+    base_fps: float = 2.0,
+    max_action_fps: float = 6.0,
+    low_motion_thresh: float = 4.0,
+    high_motion_thresh: float = 12.0,
+    short_shot_sec: float = 1.5,
     interval_sec: float = 1.0,
-    max_keyframes_per_scene: int = 30,
+    max_keyframes_per_scene: int = 150,
     min_sharpness_floor: float = 10.0,
     credits_start_sec: Optional[Union[str, float, int]] = None,
     pinned_timestamps: Optional[Dict[str, List[float]]] = None,
 ) -> Dict[str, Any]:
-    """Re-run only Step 3.3 (adaptive keyframe selection & box drawing) using existing `visual_tracks_per_frame.json`."""
+    """Re-run only Step 3.3 (motion-adaptive 2-6 fps keyframes & boxes) using existing `visual_tracks_per_frame.json`."""
     from pipeline.stage1_scenes import apply_credits_cutoff_to_shots_file
 
     if credits_start_sec is not None:
@@ -1134,6 +1529,10 @@ def reextract_keyframes_only(
             frames_predictions=frames_predictions,
             output_dir=output_dir,
             visual_prompt_thresh=visual_prompt_thresh,
+            base_fps=base_fps,
+            max_action_fps=max_action_fps,
+            low_motion_thresh=low_motion_thresh,
+            high_motion_thresh=high_motion_thresh,
             short_shot_sec=short_shot_sec,
             interval_sec=interval_sec,
             max_keyframes_per_scene=max_keyframes_per_scene,
@@ -1154,9 +1553,17 @@ def run_stage3_visual_recog(
     visual_prompt_thresh: float = 0.45,
     voice_harvest_thresh: float = 0.60,
     max_boxes_per_seed: int = 5,
-    short_shot_sec: float = 1.0,
+    min_box_area_ratio: float = 0.0015,
+    single_seed_rescue: bool = True,
+    single_seed_min_owl_score: float = 0.20,
+    single_seed_dino_thresh: float = 0.55,
+    base_fps: float = 2.0,
+    max_action_fps: float = 6.0,
+    low_motion_thresh: float = 4.0,
+    high_motion_thresh: float = 12.0,
+    short_shot_sec: float = 1.5,
     interval_sec: float = 1.0,
-    max_keyframes_per_scene: int = 30,
+    max_keyframes_per_scene: int = 150,
     min_sharpness_floor: float = 10.0,
     credits_start_sec: Optional[Union[str, float, int]] = None,
     pinned_timestamps: Optional[Dict[str, List[float]]] = None,
@@ -1180,7 +1587,7 @@ def run_stage3_visual_recog(
     tgrp_jsonl_path = os.path.join(output_dir, "tgrp_tracks.jsonl")
 
     with _local_video_context(video_path) as active_video_path:
-        # Step 3.1: Per-shot TGRP
+        # Step 3.1: Per-shot TGRP with sharpest seeds, small-box recall, carry-over & 1-seed rescue
         run_per_shot_tgrp(
             video_path=active_video_path,
             movie_id=movie_id,
@@ -1188,6 +1595,9 @@ def run_stage3_visual_recog(
             tgrp_jsonl_path=tgrp_jsonl_path,
             sam2_checkpoint=sam2_checkpoint,
             max_boxes_per_seed=max_boxes_per_seed,
+            min_box_area_ratio=min_box_area_ratio,
+            single_seed_rescue=single_seed_rescue,
+            single_seed_min_owl_score=single_seed_min_owl_score,
             restart=restart,
         )
 
@@ -1204,15 +1614,20 @@ def run_stage3_visual_recog(
             sam2_checkpoint=sam2_checkpoint,
             visual_prompt_thresh=visual_prompt_thresh,
             voice_harvest_thresh=voice_harvest_thresh,
+            single_seed_dino_thresh=single_seed_dino_thresh,
         )
 
-        # Step 3.3: Adaptive Per-Shot Sharp Keyframes with Drawn Bounding Boxes
+        # Step 3.3: Motion-Adaptive 2-6 fps Sharp Keyframes with Drawn Bounding Boxes
         updated_scenes = extract_adaptive_annotated_keyframes(
             video_path=active_video_path,
             shots_and_scenes=shots_and_scenes,
             frames_predictions=visual_tracks_payload["frames"],
             output_dir=output_dir,
             visual_prompt_thresh=visual_prompt_thresh,
+            base_fps=base_fps,
+            max_action_fps=max_action_fps,
+            low_motion_thresh=low_motion_thresh,
+            high_motion_thresh=high_motion_thresh,
             short_shot_sec=short_shot_sec,
             interval_sec=interval_sec,
             max_keyframes_per_scene=max_keyframes_per_scene,
@@ -1231,7 +1646,7 @@ def run_stage3_visual_recog(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stage A3: Per-shot TGRP tracking, DINOv2 classification, and adaptive annotated keyframes."
+        description="Stage A3: Per-shot TGRP tracking, DINOv2 classification, and 2-6 fps adaptive annotated keyframes."
     )
     parser.add_argument("--video_path", required=True, type=str, help="Path to input movie video (.mp4/.mkv)")
     parser.add_argument("--shots_file", required=True, type=str, help="Path to workdir/{movie_id}/shots_and_scenes.json")
@@ -1274,9 +1689,34 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Maximum OWLv2 boxes propagated per seed frame (default: 5)",
     )
-    parser.add_argument("--short_shot_sec", default=1.0, type=float, help="Short shot threshold in seconds (default: 1.0)")
-    parser.add_argument("--interval_sec", default=1.0, type=float, help="Keyframe sampling interval in seconds (default: 1.0)")
-    parser.add_argument("--max_keyframes_per_scene", default=30, type=int, help="Max keyframes per scene (default: 30)")
+    parser.add_argument(
+        "--min_box_area_ratio",
+        default=0.0015,
+        type=float,
+        help="Minimum OWLv2 box area fraction relative to full frame (default: 0.0015)",
+    )
+    parser.add_argument(
+        "--no_single_seed_rescue",
+        action="store_true",
+        help="Disable 1-seed high-confidence OWLv2 track rescue",
+    )
+    parser.add_argument(
+        "--single_seed_min_owl_score",
+        default=0.20,
+        type=float,
+        help="Minimum OWLv2 score for 1-seed track rescue (default: 0.20)",
+    )
+    parser.add_argument(
+        "--single_seed_dino_thresh",
+        default=0.55,
+        type=float,
+        help="Minimum DINOv2 similarity for 1-seed rescued tracks (default: 0.55)",
+    )
+    parser.add_argument("--base_fps", default=2.0, type=float, help="Baseline static keyframe rate (default: 2.0)")
+    parser.add_argument("--max_action_fps", default=6.0, type=float, help="Max action keyframe rate (default: 6.0)")
+    parser.add_argument("--short_shot_sec", default=1.5, type=float, help="Short shot threshold in seconds (default: 1.5)")
+    parser.add_argument("--interval_sec", default=1.0, type=float, help="Legacy keyframe interval param (default: 1.0)")
+    parser.add_argument("--max_keyframes_per_scene", default=150, type=int, help="Max keyframes per scene (default: 150)")
     parser.add_argument("--min_sharpness_floor", default=10.0, type=float, help="Minimum Laplacian sharpness floor (default: 10.0)")
     parser.add_argument(
         "--credits_start_sec",
@@ -1302,6 +1742,12 @@ if __name__ == "__main__":
         visual_prompt_thresh=args.visual_prompt_thresh,
         voice_harvest_thresh=args.voice_harvest_thresh,
         max_boxes_per_seed=args.max_boxes_per_seed,
+        min_box_area_ratio=args.min_box_area_ratio,
+        single_seed_rescue=not args.no_single_seed_rescue,
+        single_seed_min_owl_score=args.single_seed_min_owl_score,
+        single_seed_dino_thresh=args.single_seed_dino_thresh,
+        base_fps=args.base_fps,
+        max_action_fps=args.max_action_fps,
         short_shot_sec=args.short_shot_sec,
         interval_sec=args.interval_sec,
         max_keyframes_per_scene=args.max_keyframes_per_scene,

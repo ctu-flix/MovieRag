@@ -119,6 +119,9 @@ def subdivide_long_shots(
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Subdivide any shot longer than `max_shot_sec` into `sub_shot_sec` sub-shots.
 
+    Also records unbroken take lineage (`parent_shot_idx` and `is_subdivided_continuation`)
+    so Stage A3 can carry character boxes across subdivided seams without crossing real cuts.
+
     Returns:
         (shots_list, num_subdivided_parent_shots)
     """
@@ -129,7 +132,7 @@ def subdivide_long_shots(
     shots: List[Dict[str, Any]] = []
     subdivided_count = 0
 
-    for start_frame, end_frame in raw_shots:
+    for raw_idx, (start_frame, end_frame) in enumerate(raw_shots):
         length = end_frame - start_frame
         if length <= 0:
             continue
@@ -139,6 +142,8 @@ def subdivide_long_shots(
             shots.append(
                 {
                     "shot_idx": shot_idx,
+                    "parent_shot_idx": int(raw_idx),
+                    "is_subdivided_continuation": False,
                     "start_frame": int(start_frame),
                     "end_frame": int(end_frame),
                     "start_time": round(start_frame / fps, 3),
@@ -159,11 +164,13 @@ def subdivide_long_shots(
                 sub_ranges.append((cur, nxt))
                 cur = nxt
 
-            for s, e in sub_ranges:
+            for sub_i, (s, e) in enumerate(sub_ranges):
                 shot_idx = len(shots)
                 shots.append(
                     {
                         "shot_idx": shot_idx,
+                        "parent_shot_idx": int(raw_idx),
+                        "is_subdivided_continuation": bool(sub_i > 0),
                         "start_frame": int(s),
                         "end_frame": int(e),
                         "start_time": round(s / fps, 3),
@@ -174,13 +181,124 @@ def subdivide_long_shots(
     return shots, subdivided_count
 
 
+def build_micro_beats(
+    scene_id: str,
+    shot_ranges: List[Dict[str, Any]],
+    fps: float = 24.0,
+    min_beat_sec: float = 4.0,
+    max_beat_sec: float = 10.0,
+) -> List[Dict[str, Any]]:
+    """Partition a 15-30s Scene Window into ordered 4-10s micro-beats for dense VLM captioning."""
+    if not shot_ranges:
+        return []
+    if fps <= 0:
+        fps = 24.0
+
+    # Step 1: Split any individual shot/sub-shot longer than max_beat_sec into <= max_beat_sec spans
+    atomic_segments: List[Dict[str, Any]] = []
+    for shot in shot_ranges:
+        s_f = int(shot["start_frame"])
+        e_f = int(shot["end_frame"])
+        sh_idx = int(shot["shot_idx"])
+        if e_f <= s_f:
+            continue
+        dur = (e_f - s_f) / fps
+        if dur <= max_beat_sec:
+            atomic_segments.append(
+                {
+                    "start_frame": s_f,
+                    "end_frame": e_f,
+                    "start_time": round(s_f / fps, 3),
+                    "end_time": round(e_f / fps, 3),
+                    "shot_indices": [sh_idx],
+                }
+            )
+        else:
+            num_parts = max(2, int(math.ceil(dur / max_beat_sec)))
+            step = (e_f - s_f) / float(num_parts)
+            for p_i in range(num_parts):
+                p_s = int(round(s_f + p_i * step))
+                p_e = int(round(s_f + (p_i + 1) * step)) if p_i < num_parts - 1 else e_f
+                if p_e <= p_s:
+                    continue
+                atomic_segments.append(
+                    {
+                        "start_frame": p_s,
+                        "end_frame": p_e,
+                        "start_time": round(p_s / fps, 3),
+                        "end_time": round(p_e / fps, 3),
+                        "shot_indices": [sh_idx],
+                    }
+                )
+
+    if not atomic_segments:
+        return []
+
+    # Step 2: Merge contiguous short shots/segments into [min_beat_sec, max_beat_sec] micro-beats
+    grouped: List[List[Dict[str, Any]]] = []
+    cur: List[Dict[str, Any]] = []
+    for seg in atomic_segments:
+        if not cur:
+            cur.append(seg)
+            continue
+        cur_dur = cur[-1]["end_time"] - cur[0]["start_time"]
+        cand_dur = seg["end_time"] - cur[0]["start_time"]
+        seg_dur = seg["end_time"] - seg["start_time"]
+        if (cur_dur < min_beat_sec or seg_dur < 2.5) and cand_dur <= max_beat_sec:
+            cur.append(seg)
+        else:
+            grouped.append(cur)
+            cur = [seg]
+
+    if cur:
+        tail_dur = cur[-1]["end_time"] - cur[0]["start_time"]
+        if (
+            grouped
+            and tail_dur < 2.5
+            and (cur[-1]["end_time"] - grouped[-1][0]["start_time"]) <= max_beat_sec + 1.5
+        ):
+            grouped[-1].extend(cur)
+        else:
+            grouped.append(cur)
+
+    micro_beats: List[Dict[str, Any]] = []
+    for k, seg_group in enumerate(grouped):
+        b_sf = int(seg_group[0]["start_frame"])
+        b_ef = int(seg_group[-1]["end_frame"])
+        b_st = round(float(seg_group[0]["start_time"]), 3)
+        b_et = round(float(seg_group[-1]["end_time"]), 3)
+        shot_idxs: List[int] = []
+        for sg in seg_group:
+            for s_i in sg["shot_indices"]:
+                if s_i not in shot_idxs:
+                    shot_idxs.append(s_i)
+        micro_beats.append(
+            {
+                "beat_id": f"{scene_id}_b{k:02d}",
+                "beat_index": k,
+                "scene_id": scene_id,
+                "start_frame": b_sf,
+                "end_frame": b_ef,
+                "start_time": b_st,
+                "end_time": b_et,
+                "duration_sec": round(b_et - b_st, 3),
+                "shot_indices": shot_idxs,
+                "keyframes": [],
+            }
+        )
+    return micro_beats
+
+
 def group_shots_into_scenes(
     shots: List[Dict[str, Any]],
     movie_id: str,
     min_scene_sec: float = 12.0,
     max_scene_sec: float = 30.0,
+    fps: float = 24.0,
+    min_beat_sec: float = 4.0,
+    max_beat_sec: float = 10.0,
 ) -> List[Dict[str, Any]]:
-    """Group contiguous camera shots into 15-30s narrative Scene Windows."""
+    """Group contiguous camera shots into 15-30s narrative Scene Windows with 4-10s micro-beats."""
     if not shots:
         return []
 
@@ -226,6 +344,7 @@ def group_shots_into_scenes(
         end_frame = int(shot_group[-1]["end_frame"])
         start_time = round(float(shot_group[0]["start_time"]), 3)
         end_time = round(float(shot_group[-1]["end_time"]), 3)
+        shot_ranges_copy = [dict(s) for s in shot_group]
 
         scenes.append(
             {
@@ -236,7 +355,14 @@ def group_shots_into_scenes(
                 "start_time": start_time,
                 "end_time": end_time,
                 "duration_sec": round(end_time - start_time, 3),
-                "shot_ranges": [dict(s) for s in shot_group],
+                "shot_ranges": shot_ranges_copy,
+                "micro_beats": build_micro_beats(
+                    scene_id=scene_id,
+                    shot_ranges=shot_ranges_copy,
+                    fps=fps,
+                    min_beat_sec=min_beat_sec,
+                    max_beat_sec=max_beat_sec,
+                ),
                 "characters_present": [],
                 "keyframes": [],
             }
@@ -287,14 +413,38 @@ def apply_credits_cutoff_to_shots_file(
             scene_copy["end_frame"] = min(int(scene_copy["end_frame"]), cutoff_frame)
             scene_copy["end_time"] = round(min(float(scene_copy["end_time"]), cutoff_sec), 3)
             scene_copy["duration_sec"] = round(scene_copy["end_time"] - s_t, 3)
-            scene_copy["shot_ranges"] = [
-                sr for sr in scene_copy.get("shot_ranges", [])
-                if int(sr["start_frame"]) < cutoff_frame
-            ]
+            trimmed_ranges: List[Dict[str, Any]] = []
+            for sr in scene_copy.get("shot_ranges", []):
+                if int(sr["start_frame"]) >= cutoff_frame:
+                    continue
+                sr_copy = dict(sr)
+                if int(sr_copy["end_frame"]) > cutoff_frame:
+                    sr_copy["end_frame"] = cutoff_frame
+                    sr_copy["end_time"] = round(cutoff_frame / fps, 3)
+                trimmed_ranges.append(sr_copy)
+            scene_copy["shot_ranges"] = trimmed_ranges
             scene_copy["keyframes"] = [
                 kf for kf in scene_copy.get("keyframes", [])
                 if float(kf.get("timestamp", 0.0)) < cutoff_sec
             ]
+            # Rebuild micro_beats for trimmed scene and re-attach remaining keyframes
+            rebuilt_beats = build_micro_beats(
+                scene_id=scene_copy["scene_id"],
+                shot_ranges=trimmed_ranges,
+                fps=fps,
+            )
+            scene_kfs = scene_copy.get("keyframes", [])
+            for b_i, mb in enumerate(rebuilt_beats):
+                is_last_b = b_i == len(rebuilt_beats) - 1
+                mb["keyframes"] = [
+                    kf for kf in scene_kfs
+                    if (
+                        int(mb["start_frame"]) <= int(kf.get("frame_idx", -1)) <= int(mb["end_frame"])
+                        if is_last_b
+                        else int(mb["start_frame"]) <= int(kf.get("frame_idx", -1)) < int(mb["end_frame"])
+                    )
+                ]
+            scene_copy["micro_beats"] = rebuilt_beats
         kept_scenes.append(scene_copy)
 
     data["credits_start_sec"] = round(cutoff_sec, 3)
@@ -374,6 +524,7 @@ def run_stage1_scenes(
         movie_id=movie_id,
         min_scene_sec=min_scene_sec,
         max_scene_sec=max_scene_sec,
+        fps=fps,
     )
     avg_scene_dur = (
         sum(s["duration_sec"] for s in scenes) / len(scenes) if scenes else 0.0
