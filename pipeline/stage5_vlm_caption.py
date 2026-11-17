@@ -631,7 +631,10 @@ def build_micro_beat_prompt(
         f"Overlay key: {legend_str}\n"
         f"CRITICAL VISUAL RULE: Any colored rectangles drawn on the frames are synthetic computer-vision tracking overlays. "
         f"NEVER mention bounding boxes, rectangles, box colors, or 'Frame 1/2' labels in your output, and NEVER confuse "
-        f"a tracking box color with hair color, clothing color, or glowing objects.\n\n"
+        f"a tracking box color with hair color, clothing color, or glowing objects. "
+        f"Note: Tracking boxes are automated hints and may occasionally be missing, shifted, or mislabeled—always verify "
+        f"a character's identity against what you actually see in the frames, the [Character Reference Glossary], and the "
+        f"[Time-Matched Act Reference].\n\n"
         f"{act_block}"
         f"[ALREADY HAPPENED IN PREVIOUS BEAT — CONTEXT ONLY, DO NOT RE-DESCRIBE]\n"
         f"{prev_beat_caption or 'Opening beat of the film.'}\n"
@@ -911,6 +914,32 @@ def _prepare_scene_micro_beats(scene: Dict[str, Any], fps: float) -> List[Dict[s
     return beats
 
 
+def _select_prev_overlap_keyframes(
+    prev_beat_kfs: List[Dict[str, Any]],
+    max_frames: int = 4,
+    window_sec: float = 1.0,
+) -> List[Dict[str, Any]]:
+    """Select trailing keyframes from the last `window_sec` of the previous beat, capped at `max_frames`."""
+    if max_frames <= 0 or not prev_beat_kfs:
+        return []
+    ordered = sorted(
+        prev_beat_kfs,
+        key=lambda kf: (int(kf.get("frame_idx", 0)), float(kf.get("timestamp", 0.0))),
+    )
+    if window_sec <= 0.0:
+        return ordered[-max_frames:]
+    end_ts = float(ordered[-1].get("timestamp", 0.0))
+    in_window = [kf for kf in ordered if float(kf.get("timestamp", 0.0)) >= (end_ts - window_sec - 1e-6)]
+    if not in_window:
+        return [ordered[-1]]
+    if len(in_window) <= max_frames:
+        return in_window
+    if max_frames == 1:
+        return [in_window[-1]]
+    idxs = [round(i * (len(in_window) - 1) / float(max_frames - 1)) for i in range(max_frames)]
+    return [in_window[i] for i in idxs]
+
+
 def _caption_one_beat(
     client,
     vlm_model_id: str,
@@ -1006,7 +1035,8 @@ def run_single_scene_diagnostic(
     api_base_url: str = "https://api.deepseek.com",
     max_keyframes_per_scene: int = 150,
     max_keyframes_per_beat: int = 60,
-    prev_overlap_frames: int = 2,
+    prev_overlap_frames: int = 4,
+    prev_overlap_sec: float = 1.0,
     max_image_width: int = 960,
     min_keyframe_sharpness: float = 5.0,
 ) -> Dict[str, Any]:
@@ -1054,9 +1084,17 @@ def run_single_scene_diagnostic(
         prev_beats = _prepare_scene_micro_beats(prev_scene, fps=fps)
         prev_subtitles = prev_scene.get("subtitles", [])
         if prev_beats and prev_overlap_frames > 0:
-            prev_overlap_kfs = prev_beats[-1].get("keyframes", [])[-prev_overlap_frames:]
+            prev_overlap_kfs = _select_prev_overlap_keyframes(
+                prev_beats[-1].get("keyframes", []),
+                max_frames=prev_overlap_frames,
+                window_sec=prev_overlap_sec,
+            )
         elif prev_scene.get("keyframes") and prev_overlap_frames > 0:
-            prev_overlap_kfs = prev_scene.get("keyframes", [])[-prev_overlap_frames:]
+            prev_overlap_kfs = _select_prev_overlap_keyframes(
+                prev_scene.get("keyframes", []),
+                max_frames=prev_overlap_frames,
+                window_sec=prev_overlap_sec,
+            )
         if prev_scene.get("vlm_caption"):
             prev_beat_caption = str(prev_scene["vlm_caption"])[-600:]
 
@@ -1104,7 +1142,11 @@ def run_single_scene_diagnostic(
             }
         )
         prev_beat_caption = cap
-        prev_overlap_kfs = b.get("keyframes", [])[-prev_overlap_frames:] if prev_overlap_frames > 0 else []
+        prev_overlap_kfs = _select_prev_overlap_keyframes(
+            b.get("keyframes", []),
+            max_frames=prev_overlap_frames,
+            window_sec=prev_overlap_sec,
+        )
         prev_subtitles = b.get("subtitles", [])
 
     merged_caption = "\n\n".join(
@@ -1152,7 +1194,8 @@ def run_stage5_vlm_caption(
     api_base_url: str = "https://api.deepseek.com",
     max_keyframes_per_scene: int = 150,
     max_keyframes_per_beat: int = 60,
-    prev_overlap_frames: int = 2,
+    prev_overlap_frames: int = 4,
+    prev_overlap_sec: float = 1.0,
     max_image_width: int = 960,
     min_keyframe_sharpness: float = 5.0,
     credits_start_sec: Optional[Union[str, float, int]] = None,
@@ -1279,10 +1322,10 @@ def run_stage5_vlm_caption(
                     prev_subtitles = beat.get("subtitles", [])
                     continue
 
-                overlap_kfs = (
-                    prev_beat_kfs[-prev_overlap_frames:]
-                    if (prev_overlap_frames > 0 and prev_beat_kfs)
-                    else []
+                overlap_kfs = _select_prev_overlap_keyframes(
+                    prev_beat_kfs,
+                    max_frames=prev_overlap_frames,
+                    window_sec=prev_overlap_sec,
                 )
                 t0 = time.perf_counter()
                 beat_caption, used_kfs, overlap_used, usage = _caption_one_beat(
@@ -1448,7 +1491,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api_base_url", default="https://api.deepseek.com")
     parser.add_argument("--max_keyframes_per_scene", type=int, default=150)
     parser.add_argument("--max_keyframes_per_beat", type=int, default=60)
-    parser.add_argument("--prev_overlap_frames", type=int, default=2)
+    parser.add_argument("--prev_overlap_frames", type=int, default=4)
+    parser.add_argument("--prev_overlap_sec", type=float, default=1.0)
     parser.add_argument("--max_image_width", type=int, default=960)
     parser.add_argument("--min_keyframe_sharpness", type=float, default=5.0)
     parser.add_argument(
@@ -1475,6 +1519,7 @@ if __name__ == "__main__":
         max_keyframes_per_scene=args.max_keyframes_per_scene,
         max_keyframes_per_beat=args.max_keyframes_per_beat,
         prev_overlap_frames=args.prev_overlap_frames,
+        prev_overlap_sec=args.prev_overlap_sec,
         max_image_width=args.max_image_width,
         min_keyframe_sharpness=args.min_keyframe_sharpness,
         credits_start_sec=args.credits_start_sec,
