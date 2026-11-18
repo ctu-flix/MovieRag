@@ -37,52 +37,60 @@ from pipeline.stage1_scenes import (
 
 
 SINTEL_FALLBACK_PLOT = (
-    "Sintel (2010) — Full Plot & Ending Twist Synopsis:\n\n"
-    "Act I.A — The Snowstorm and the Gatekeeper Ambush (00:00 - 02:05):\n"
-    "Sintel, a lone young woman warrior bundled in a fur-lined cloak and carrying a wooden staff, "
-    "wanders across a desolate, snow-swept mountain wilderness. At a mountain pass, she is ambushed "
-    "by a masked Gatekeeper warrior wielding a curved spear-blade with a circular hilt ring. After a "
-    "tense close-quarters fight in the snow, Sintel disarms and defeats the Gatekeeper, claims his "
-    "distinctive curved spear-blade, and collapses in the freezing storm.\n\n"
-    "Act I.B — Awakening in the Shaman's Hut (02:05 - 03:35):\n"
-    "Sintel awakens inside a warmly lit desert hut tended by an elderly tribal Shaman with long white "
-    "dreadlocks and ceremonial robes, who offers her shelter and asks what brings her to the land of "
-    "the gatekeepers. Sintel reveals that she is searching the world for a dragon companion who was "
-    "taken from her.\n\n"
-    "Act II.A — Flashback in Ishtar: Finding and Healing Scales (03:35 - 04:35):\n"
-    "In a flashback to Sintel's earlier life in the bustling sunlit city of Ishtar, she scavenges for "
-    "food and comes across a wounded, frightened baby red dragon with an injured wing. She brings the "
-    "hatchling back to her rooftop shelter, feeds him, wraps a makeshift bandage around his torn wing, "
-    "and names him Scales. Over time, Sintel and Scales form a deep affectionate bond as she heals him "
-    "and teaches him how to fly again.\n\n"
-    "Act II.B — The Kidnapping of Scales Over Ishtar (04:35 - 05:15):\n"
-    "As Scales practices flying and soars high above the rooftops of Ishtar, a giant winged Adult Dragon "
-    "descends out of the clouds, snatches Scales in its talons, and carries him away into the sky despite "
-    "Sintel's desperate chase across the city.\n\n"
-    "Act III.A — The Cross-Continental Quest and Snowstorm Collapse (05:15 - 07:15):\n"
-    "Vowing to bring Scales back, Sintel sets out on an arduous solitary quest across scorching desert "
-    "dunes, misty bamboo forests, and rocky mountain passes—growing visibly older and more weathered over "
-    "years of fruitless searching before collapsing exhausted in a blinding snowstorm.\n\n"
-    "Act III.B — Return to the Shaman's Hut and Renewed Resolve (07:15 - 08:40):\n"
-    "Back inside the Shaman's hut at the end of her flashback, the Shaman warns Sintel that she has reached "
-    "the end of her search and that some things cannot be found the way we expect. Hearing wingbeats or "
-    "wind outside, Sintel grabs her cloak and the Gatekeeper's spear-blade and rushes back out into the night.\n\n"
-    "Act III.C — Climbing the Volcanic Peak and Entering the Dragon Cavern (08:40 - 10:15):\n"
-    "Carrying the Gatekeeper's curved spear-blade with its circular hilt ring, Sintel climbs a jagged "
-    "volcanic peak at night and enters a massive dark cavern lair. Deep inside the cave, she discovers a "
-    "fledgling baby red dragon curled beside a giant sleeping Adult Dragon and creeps forward hoping to "
-    "rescue the hatchling quietly.\n\n"
-    "Act IV — The Cavern Battle and the Wing-Scar Twist (10:15 - 12:24):\n"
-    "Before Sintel can escape with the hatchling, the giant Adult Dragon wakes up and attacks furiously to "
-    "protect the cavern. In the brutal clash, the Adult Dragon knocks Sintel's weapon aside, pins her "
-    "helplessly to the cavern floor, and prepares a fatal strike, but abruptly pauses as it stares closely "
-    "into Sintel's eyes—recognizing her and pulling back instead of killing her. Unaware of why the beast "
-    "hesitated, Sintel seizes her spear-blade and drives it straight into the Adult Dragon's chest. As the "
-    "giant dragon collapses dying on the stone floor (~11:15), Sintel notices a familiar healed notch and "
-    "bandage-wrap scar along its wing—the exact wound she bound on Scales years ago. Realizing too late "
-    "that the giant Adult Dragon she has just slain was her grown-up Scales and the little red dragon "
-    "cowering nearby is Scales's offspring, a grief-stricken Sintel walks blindly out into the falling snow "
-    "while the orphaned baby dragon quietly trails after her."
+    "Sintel (2010) — Time-Aligned Sub-Beat Grounding Reference:\n\n"
+    "Prologue.A — Black Screen & Opening Credits Over Empty Snowy Mountains (00:00 - 00:25):\n"
+    "The film opens on a black screen (00:00 - 00:03) before gliding aerially through an empty, misty "
+    "snow-covered mountain pass displaying production credit titles. No characters appear in this window.\n\n"
+    "Act I.A1 — Sintel's Snow Trek and the Gatekeeper's Leap (00:25 - 00:47):\n"
+    "Sintel trudges alone through deep snow carrying a wooden staff. Pausing in the freezing wind, she spots "
+    "the unmasked, bald, bearded Gatekeeper (with tall wooden banner poles strapped to his back) leaping down "
+    "from a snowy ridge through the mist to ambush her. They clash weapons and Sintel is knocked backward down the slope.\n\n"
+    "Act I.A2 — The Staff Breaks & Sintel Is Pinned (00:47 - 01:05):\n"
+    "Sintel and the Gatekeeper trade strikes in the snow until the Gatekeeper's curved spear-blade slices Sintel's "
+    "wooden staff cleanly in two (~00:55). Disarmed, Sintel is thrown onto her back in the snow as the Gatekeeper "
+    "looms over her and raises his spear-blade to impale her. (The fight does NOT end in this window).\n\n"
+    "Act I.A3 — Fatal Counter-Strike, Claiming the Spear-Blade, and Snowstorm Collapse (01:05 - 01:41):\n"
+    "As the Gatekeeper presses his spear-blade down toward Sintel's chest, she holds the shaft back with one hand, "
+    "grabs the sharp broken half of her wooden staff from the snow, and drives it upward into the Gatekeeper (~01:10). "
+    "He collapses dead in the snow, leaving his spear-blade resting across her chest. Sintel recovers, pulls the "
+    "Gatekeeper's curved spear-blade from the snow beside his body (~01:26), trudges past the 'SINTEL' title emblem, "
+    "and collapses exhausted in the snowstorm (~01:38).\n\n"
+    "Act I.B — Awakening in the Shaman's Hut (01:41 - 02:35):\n"
+    "Sintel awakens inside a firelit desert hut tended by an elderly, clean-shaven Shaman with long white dreadlocks "
+    "and white face paint. The Shaman examines her captured spear-blade by the fire, notes its dark past, hands Sintel "
+    "a bowl of soup, and asks what brings her to the land of the gatekeepers. Sintel reveals she is searching for a dragon.\n\n"
+    "Act II.A — Flashback in Ishtar: Scavenging & Finding Injured Scales (02:35 - 03:35):\n"
+    "In a flashback to the sunlit desert city of Ishtar, a stocky townsman walks down an alley with a cart while teenage "
+    "Sintel hides behind crates (02:35 - 02:42). Sintel sneaks out to scavenge a piece of fruit, hears a sound, and climbs "
+    "a ladder onto a tiled rooftop (~02:58) where she discovers Scales, a small baby red dragon with an injured wing. She "
+    "coaxes Scales with the fruit and brings him to her shelter.\n\n"
+    "Act II.B — Healing Scales & Learning to Fly in Ishtar (03:35 - 04:55):\n"
+    "Sintel bandages Scales's injured wing, feeds him, and forms a close bond with him over time in Ishtar. Once his wing "
+    "heals, Sintel removes the bandage and helps Scales practice flying across the city streets and rooftops.\n\n"
+    "Act II.C — The Kidnapping of Scales Over Ishtar (04:55 - 05:35):\n"
+    "As Scales flies high above the rooftops of Ishtar, a giant Adult Dragon swoops down from the clouds, snatches Scales "
+    "in its talons, and carries him away despite Sintel's desperate chase across the rooftops.\n\n"
+    "Act III.A — The Cross-Continental Quest Montage (05:35 - 07:05):\n"
+    "Vowing to rescue Scales, Sintel journeys alone across bamboo forests, scorching deserts, and snowy mountains over "
+    "years of searching until collapsing in the snowstorm.\n\n"
+    "Act III.B — The Spear-Blade Glyph Reveal in the Shaman's Hut (07:05 - 08:15):\n"
+    "Back in the Shaman's hut, Sintel despairs that she has failed, but the Shaman points out the tree emblem engraved "
+    "on the Gatekeeper's spear-blade—revealing that the Gatekeeper guards the dragon's volcanic peak nearby. Sintel seizes "
+    "the spear-blade and rushes out.\n\n"
+    "Act III.C — Climbing the Volcanic Peak & Entering the Dragon Cavern (08:15 - 09:45):\n"
+    "Sintel climbs a jagged volcanic peak and creeps into a dark cavern lair, where she spots a fledgling baby red dragon "
+    "curled beside a giant sleeping Adult Dragon. She tries to coax the hatchling away quietly.\n\n"
+    "Act IV.A — The Cavern Battle & The Fatal Hesitation (09:45 - 11:15):\n"
+    "The giant Adult Dragon awakens and attacks furiously. It knocks Sintel's spear-blade aside, pins her to the stone "
+    "floor, and prepares to strike, but pauses as it recognizes Sintel's eyes and pulls back. Unaware of why the dragon "
+    "hesitated, Sintel grabs her spear-blade and plunges it into the Adult Dragon's chest.\n\n"
+    "Act IV.B — The Wing-Scar & Blood-Reflection Twist and Cavern Collapse (11:15 - 12:35):\n"
+    "As the dying Adult Dragon collapses, Sintel sees the familiar healed notch scar on its wing and glimpses her own aged, "
+    "gray-streaked reflection in a pool of the dragon's blood—realizing decades have passed and she has just killed her "
+    "grown-up Scales. As the cavern begins to collapse around them, a grief-stricken Sintel flees into the falling snow "
+    "while the orphaned baby dragon trails behind her.\n\n"
+    "Epilogue — Closing Credits (12:35 - 14:48):\n"
+    "Closing credits roll over dark backgrounds and concept art."
 )
 
 
@@ -294,11 +302,11 @@ def _load_appearance_windows(
             except Exception:
                 pass
 
-    # Dedicated appearance_windows.json files (repo -> workdir -> Drive char_bank -> caller override)
+    # Dedicated appearance_windows.json files (Drive/workdir -> repo -> caller override)
     window_cands: List[Optional[str]] = [
-        str(PROJECT_ROOT / "char_bank" / movie_slug / "appearance_windows.json"),
-        os.path.join(output_dir, "appearance_windows.json"),
         char_bank_dir and os.path.join(char_bank_dir, "appearance_windows.json"),
+        os.path.join(output_dir, "appearance_windows.json"),
+        str(PROJECT_ROOT / "char_bank" / movie_slug / "appearance_windows.json"),
     ]
     for cand in window_cands:
         if cand and os.path.isfile(cand):
@@ -324,10 +332,10 @@ def _load_external_plot_documents(
     candidates: List[str] = []
     if external_plot_file:
         candidates.append(external_plot_file)
+    candidates.append(str(PROJECT_ROOT / "char_bank" / movie_id / "external_plot.txt"))
     if char_bank_dir:
         candidates.append(os.path.join(char_bank_dir, "external_plot.txt"))
         candidates.append(os.path.join(char_bank_dir, "external_plot.json"))
-    candidates.append(str(PROJECT_ROOT / "char_bank" / movie_id / "external_plot.txt"))
 
     for cand in candidates:
         if not cand or not os.path.isfile(cand):
@@ -346,7 +354,7 @@ def _load_external_plot_documents(
                 return [
                     {
                         "doc_id": f"{movie_id}_full_plot_01",
-                        "title": "Full Plot & Ending Twist Synopsis",
+                        "title": "Time-Aligned Sub-Beat Grounding Reference",
                         "tier": "full_movie",
                         "start_time": 0.0,
                         "end_time": round(float(duration_sec), 3),
@@ -358,7 +366,7 @@ def _load_external_plot_documents(
         return [
             {
                 "doc_id": "sintel_full_plot_01",
-                "title": "Full Plot & Ending Twist Synopsis",
+                "title": "Time-Aligned Sub-Beat Grounding Reference",
                 "tier": "full_movie",
                 "start_time": 0.0,
                 "end_time": round(float(duration_sec), 3),
@@ -461,19 +469,50 @@ def _format_color_legend_and_glossary(
     beat_subtitles: Optional[List[Dict[str, Any]]] = None,
     appearance_windows: Optional[Dict[str, List[List[float]]]] = None,
     beat_characters_present: Optional[List[Any]] = None,
+    out_of_window_min_score: float = 0.60,
 ) -> Tuple[str, str]:
-    """Build synthetic box legend and gate Character Reference Glossary strictly to active beat entities."""
-    char_colors: Dict[str, str] = {}
-    active_chars: set = set()
+    """Build synthetic box legend and gate Character Reference Glossary strictly to active beat entities.
+
+    Cross-checks visual tracker detections against `appearance_windows`: if a character is detected
+    outside their valid timeline window (e.g., Shaman misclassified on the Gatekeeper at max_score=0.5049),
+    requires `score >= out_of_window_min_score` (default 0.60) before allowing them into the legend or glossary.
+    """
+    b_start = float(beat_start if beat_start is not None else scene.get("start_time", 0.0))
+    b_end = float(beat_end if beat_end is not None else scene.get("end_time", 0.0))
+    b_mid = 0.5 * (b_start + b_end)
+
+    # First determine which characters fall inside their manual appearance_windows for this beat
+    in_window_chars: Set[str] = set()
+    if appearance_windows:
+        for name, windows in appearance_windows.items():
+            for win in windows:
+                if not isinstance(win, (list, tuple)) or len(win) < 2:
+                    continue
+                w_start, w_end = float(win[0]), float(win[1])
+                if (w_start <= b_mid <= w_end) or (min(b_end, w_end) > max(b_start, w_start)):
+                    in_window_chars.add(name)
+                    break
+
+    def _is_valid_visual_detection(name: str, score: float) -> bool:
+        if appearance_windows and name in appearance_windows and name not in in_window_chars:
+            return score >= out_of_window_min_score
+        return score >= 0.45
+
+    # Gather peak visual detection score and box color per character across beat keyframes & metadata
+    char_peak_score: Dict[str, float] = {}
+    char_candidate_color: Dict[str, str] = {}
 
     for kf in sampled_kfs:
         for cv in kf.get("characters_visible", []):
             name = cv.get("name")
+            if not name:
+                continue
+            sc = float(cv.get("score", 1.0))
             color = cv.get("color")
-            if name:
-                active_chars.add(name)
-                if color and name not in char_colors:
-                    char_colors[name] = color
+            if name not in char_peak_score or sc > char_peak_score[name]:
+                char_peak_score[name] = sc
+            if color and name not in char_candidate_color:
+                char_candidate_color[name] = color
 
     # Include explicit beat_characters_present when provided, or fallback to scene when no beat bounds were passed
     present_source = (
@@ -485,19 +524,33 @@ def _format_color_legend_and_glossary(
         if isinstance(cp, dict):
             name = cp.get("name")
             color = cp.get("color_prompt") or cp.get("color")
+            sc = float(cp.get("max_score", cp.get("score", 1.0)))
         else:
             name = str(cp)
             color = None
-        if name:
-            active_chars.add(name)
-            if color and name not in char_colors:
-                char_colors[name] = color
+            sc = 1.0
+        if not name:
+            continue
+        if name not in char_peak_score or sc > char_peak_score[name]:
+            char_peak_score[name] = sc
+        if color and name not in char_candidate_color:
+            char_candidate_color[name] = color
 
     # Fallback color lookup from scene if beat_characters_present lacked color
-    if active_chars and not char_colors:
-        for cp in scene.get("characters_present", []):
-            if isinstance(cp, dict) and cp.get("name") in active_chars and cp.get("color_prompt"):
-                char_colors[cp["name"]] = cp["color_prompt"]
+    for cp in scene.get("characters_present", []):
+        if isinstance(cp, dict) and cp.get("name") in char_peak_score and cp.get("color_prompt"):
+            cname = cp["name"]
+            if cname not in char_candidate_color:
+                char_candidate_color[cname] = cp["color_prompt"]
+
+    char_colors: Dict[str, str] = {}
+    active_chars: Set[str] = set(in_window_chars)
+
+    for name, peak_sc in char_peak_score.items():
+        if _is_valid_visual_detection(name, peak_sc):
+            active_chars.add(name)
+            if name in char_candidate_color:
+                char_colors[name] = char_candidate_color[name]
 
     if char_colors:
         legend_items = [f"{color} rectangle = {name}" for name, color in char_colors.items()]
@@ -513,20 +566,6 @@ def _format_color_legend_and_glossary(
         for name in glossary:
             if spk.lower() == name.lower() or re.search(rf"\b{re.escape(name.lower())}\b", txt_lower):
                 active_chars.add(name)
-
-    # Check manual appearance_windows overlap against beat time range
-    b_start = float(beat_start if beat_start is not None else scene.get("start_time", 0.0))
-    b_end = float(beat_end if beat_end is not None else scene.get("end_time", 0.0))
-    b_mid = 0.5 * (b_start + b_end)
-    if appearance_windows:
-        for name, windows in appearance_windows.items():
-            for win in windows:
-                if not isinstance(win, (list, tuple)) or len(win) < 2:
-                    continue
-                w_start, w_end = float(win[0]), float(win[1])
-                if (w_start <= b_mid <= w_end) or (min(b_end, w_end) > max(b_start, w_start)):
-                    active_chars.add(name)
-                    break
 
     glossary_lines = [f"- {name}: {desc}" for name, desc in glossary.items() if name in active_chars]
     glossary_str = (
@@ -549,9 +588,10 @@ def build_micro_beat_prompt(
     act_plot_context: str = "",
     appearance_windows: Optional[Dict[str, List[List[float]]]] = None,
 ) -> str:
-    """Build the micro-beat prompt replacing [EXIT_STATE] with visual overlap + prior beat context."""
+    """Build the micro-beat prompt with telemetry alerts, duration-scaled word budget, and anti-premature-closure rules."""
     b_start = float(beat.get("start_time", scene["start_time"]))
     b_end = float(beat.get("end_time", scene["end_time"]))
+    beat_dur = max(0.0, b_end - b_start)
     t0_str = _format_mmss(b_start)
     t1_str = _format_mmss(b_end)
     cur_subs = beat.get("subtitles", scene.get("subtitles", []))
@@ -566,6 +606,33 @@ def build_micro_beat_prompt(
         appearance_windows=appearance_windows,
         beat_characters_present=beat.get("characters_present"),
     )
+
+    # Low-level telemetry computation (sharpness & tracked character presence)
+    sharp_vals = [float(kf.get("sharpness", 100.0)) for kf in sampled_kfs]
+    max_sharpness = max(sharp_vals) if sharp_vals else 100.0
+    has_tracked_chars = not legend_str.startswith("No synthetic tracking boxes")
+
+    telemetry_notes: List[str] = []
+    if sampled_kfs and max_sharpness < 1.0:
+        telemetry_notes.append(
+            "[TELEMETRY ALERT: All frames in this beat are nearly pure black/blank (sharpness < 1.0). "
+            "Describe ONLY a black screen or fade transition—DO NOT invent characters or scenery.]"
+        )
+    if not has_tracked_chars:
+        telemetry_notes.append(
+            "[TELEMETRY NOTE: Automated face/body tracker detected 0 named characters in these frames. "
+            "Only describe a named character if they are unmistakably visible in the pixels (e.g., distant "
+            "silhouette or back turned); otherwise describe only the environment, title text, or background extras.]"
+        )
+    telemetry_block = ("\n".join(telemetry_notes) + "\n\n") if telemetry_notes else ""
+
+    # Duration & sharpness scaled word budget
+    if max_sharpness < 2.0:
+        word_budget_str = "20 to 40 words max (black screen / transition)"
+    elif beat_dur <= 5.0:
+        word_budget_str = "60 to 110 words max"
+    else:
+        word_budget_str = "100 to 180 words max"
 
     overlap_timeline = (
         ", ".join(
@@ -613,7 +680,12 @@ def build_micro_beat_prompt(
             f"2. NEVER invent monsters, locations, or objects that contradict the frames and Act Reference, "
             f"and NEVER pull future plot beats or absent characters into [{t0_str} - {t1_str}].\n"
             f"3. Report every concrete physical event (weapon pick-ups/drops, disarming, injuries, exits/entrances) "
-            f"that actually happens within the current beat frames.\n\n"
+            f"that actually happens within the current beat frames.\n"
+            f"4. ANTI-PREMATURE-CLOSURE RULE: Your beat spans ONLY {beat_dur:.1f} seconds [{t0_str} - {t1_str}]. "
+            f"The [Time-Matched Act Reference] covers a much longer time window. If an action (such as a fight, "
+            f"chase, or conversation) is still in progress in the final attached keyframe, end your description "
+            f"mid-action in the exact pose shown in the final frame. NEVER wrap up a fight or kill off a character "
+            f"unless the final attached keyframe visibly shows that outcome.\n\n"
         )
 
     return (
@@ -621,6 +693,7 @@ def build_micro_beat_prompt(
         f"[{t0_str} - {t1_str}] inside Scene {scene.get('scene_index', 0)} from '{movie_title}'.\n"
         f"Context Overlap Frames Attached First (DO NOT RE-DESCRIBE): {len(prev_overlap_kfs)} [{overlap_timeline}]\n"
         f"Current Beat Keyframes Attached Next (DESCRIBE ONLY THESE): {len(sampled_kfs)} [{kf_timeline}]\n\n"
+        f"{telemetry_block}"
         f"[Character Reference Glossary (Active in This Beat)]\n{glossary_str}\n"
         f"IMPORTANT ANTI-BOILERPLATE & APPEARANCE RULES:\n"
         f"1. Refer to known active characters by their exact glossary names; do NOT introduce characters "
@@ -642,9 +715,8 @@ def build_micro_beat_prompt(
         f"[Spoken Dialogue in This Beat]\n{cur_subs_str}\n\n"
         f"[Task]\n"
         f"Write ONE cohesive, chronological present-tense description covering ONLY what happens in the Current Beat "
-        f"Keyframes [{t0_str} - {t1_str}] (soft cap: up to 400 words max, scaling naturally with the amount of action—"
-        f"stop immediately once the final frame is described, NEVER repeat sentences or clauses, and DO NOT re-describe "
-        f"the Context Overlap Frames):\n"
+        f"Keyframes [{t0_str} - {t1_str}] (strict length target: {word_budget_str}—stop immediately once the final frame "
+        f"is described, NEVER repeat sentences or clauses, and DO NOT re-describe the Context Overlap Frames):\n"
         f"1. Setting & Camera/Staging: Briefly note environment, lighting, and character spatial layout (especially when cutting or moving).\n"
         f"2. Step-by-Step Physical Action & Exchanges: Trace exact movements, combat strikes, weapon/prop acquisitions or drops, "
         f"and cause-and-effect reactions across the frames. {dialogue_guidance}\n"
@@ -733,7 +805,7 @@ def _call_deepseek_vision(
     image_paths: List[str],
     prev_overlap_image_paths: Optional[List[str]] = None,
     max_image_width: int = 960,
-    max_new_tokens: int = 1100,
+    max_new_tokens: int = 450,
     max_retries: int = 3,
 ) -> Tuple[str, Dict[str, int]]:
     """Send optional overlap context frames + beat keyframes + prompt to deepseek-flash with thinking disabled."""
@@ -776,9 +848,12 @@ def _call_deepseek_vision(
         {
             "role": "system",
             "content": (
-                "You are an expert film analyst for a multimodal video retrieval system. "
-                "Follow all formatting constraints strictly, stop immediately after the last frame, "
-                "never repeat sentences, never mention synthetic bounding boxes, and never re-describe overlap context frames."
+                "You are a frame-accurate forensic video annotator for a multimodal retrieval system. "
+                "Your primary directive is VISUAL FIDELITY OVER PLOT COMPLETION: describe ONLY what is "
+                "physically visible in the attached Current Beat Keyframes. Never advance or conclude a "
+                "fight, conversation, or action beyond the final attached Current Beat Keyframe, never "
+                "invent actions to match the Act Reference if they have not happened yet on screen, never "
+                "repeat sentences, never mention synthetic bounding boxes, and never re-describe overlap context frames."
             ),
         },
         {"role": "user", "content": content_items},
@@ -993,7 +1068,7 @@ def _caption_one_beat(
         image_paths=kf_abs_paths,
         prev_overlap_image_paths=overlap_abs_paths,
         max_image_width=max_image_width,
-        max_new_tokens=1100,
+        max_new_tokens=450,
     )
     beat_caption = _parse_beat_caption(raw_output)
     return (
