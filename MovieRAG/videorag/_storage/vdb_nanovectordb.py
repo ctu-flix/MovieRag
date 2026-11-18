@@ -81,7 +81,7 @@ except ImportError:
             query: np.ndarray,
             top_k: int = 10,
             better_than_threshold: Optional[float] = None,
-            filter: Optional[Callable[[dict], bool]] = None,
+            filter_lambda: Optional[Callable[[dict], bool]] = None,
         ) -> list[dict]:
             if len(self._data) == 0:
                 return []
@@ -90,8 +90,8 @@ except ImportError:
             if q_norm > 0:
                 q = q / q_norm
 
-            if filter is not None:
-                valid_indices = [i for i, d in enumerate(self._data) if filter(d)]
+            if filter_lambda is not None:
+                valid_indices = [i for i, d in enumerate(self._data) if filter_lambda(d)]
             else:
                 valid_indices = list(range(len(self._data)))
             if not valid_indices:
@@ -178,7 +178,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
             query=embedding,
             top_k=top_k,
             better_than_threshold=self.cosine_better_than_threshold,
-            filter=filter_lambda,
+            filter_lambda=filter_lambda,
         )
         results = [
             {**dp, "id": dp["__id__"], "distance": dp["__metrics__"]} for dp in results
