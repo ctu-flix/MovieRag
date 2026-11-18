@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import TypedDict, Union, Literal, Generic, TypeVar
+from typing import TypedDict, Union, Literal, Generic, TypeVar, Optional, Callable
 
 import numpy as np
 
@@ -8,21 +8,32 @@ from ._utils import EmbeddingFunc
 
 @dataclass
 class QueryParam:
-    mode: Literal["local", "global", "naive"] = "global"
+    mode: Literal["local", "global", "naive", "videorag", "videorag_multiple_choice"] = "videorag"
     only_need_context: bool = False
     response_type: str = "Multiple Paragraphs"
     level: int = 2
-    top_k: int = 20
+    top_k: int = 10
     # naive search
-    naive_max_token_for_text_unit = 12000
-    # videorag search
-    only_need_context: bool = False
+    naive_max_token_for_text_unit: int = 12000
+    # videorag search & spoiler-aware agentic retrieval
+    wo_reference: bool = False
+    current_timestamp: Optional[float] = None
+    spoiler_free: bool = True
+    max_tool_rounds: int = 3
+    chat_history: list[dict[str, str]] = field(default_factory=list)
 
 
-TextChunkSchema = TypedDict(
-    "TextChunkSchema",
-    {"tokens": int, "content": str, "video_segment_id": str, "chunk_order_index": int},
-)
+class TextChunkSchema(TypedDict, total=False):
+    tokens: int
+    content: str
+    video_segment_id: Union[str, list[str]]
+    chunk_order_index: int
+    movie_id: str
+    start_time: float
+    end_time: float
+    tier: Literal["scene", "chapter", "full_movie"]
+    characters: list[str]
+
 
 SingleCommunitySchema = TypedDict(
     "SingleCommunitySchema",
@@ -69,7 +80,9 @@ class BaseVectorStorage(StorageNameSpace):
     embedding_func: EmbeddingFunc
     meta_fields: set = field(default_factory=set)
 
-    async def query(self, query: str, top_k: int) -> list[dict]:
+    async def query(
+        self, query: str, top_k: int, filter_lambda: Optional[Callable[[dict], bool]] = None
+    ) -> list[dict]:
         raise NotImplementedError
 
     async def upsert(self, data: dict[str, dict]):

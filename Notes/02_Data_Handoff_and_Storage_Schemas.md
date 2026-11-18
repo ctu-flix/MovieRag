@@ -1,5 +1,5 @@
 ---
-Date: 2026-11-11
+Date: 2026-11-18
 Top Level:
   - "[[_tech_]]"
 Topic:
@@ -11,56 +11,56 @@ Topic:
 # Data Handoff & Storage Schemas
 
 > Part of [[00_MovieRAG_Master_Plan]]
-> Defines the intermediate JSON contract between Phase A (`Animated_AD` + VLM) and Phase B (`MovieRAG`), as well as the upgraded internal schemas for `NanoVectorDB`, `JsonKVStorage`, and `NetworkX`.
+> Defines the intermediate JSON contract between Phase A (`Animated_AD` + `DeepSeek-Flash` micro-beat VLM) and Phase B (`MovieRAG`), as well as the upgraded internal schemas for `NanoVectorDB`, `JsonKVStorage`, and `NetworkX`.
 
 ---
 
 ## 1. Handoff Artifact: `movie_knowledge_bundle.json`
 
-Saved at `workdir/{movie_id}/movie_knowledge_bundle.json`. Once this file and `workdir/{movie_id}/keyframes/` are generated on Colab Pro and synced via `rclone`, **all downstream GraphRAG indexing and chat querying can run locally without touching the raw video file**.
+Saved at `workdir/{movie_id}/movie_knowledge_bundle.json`. Once this file and `workdir/{movie_id}/keyframes/` are generated on Colab and synced via `rclone`, **all downstream GraphRAG indexing and chat querying can run locally without touching the raw video file**.
+
+> **Note on Micro-Beats & Schema Compatibility**: Intermediate shot/beat boundaries (`parent_shot_idx`, `is_subdivided_continuation`, and `scene["micro_beats"]`) live in `shots_and_scenes.json` and `vlm_beats.jsonl`. In `movie_knowledge_bundle.json`, Stage A5 merges consecutive 4–10s micro-beats back into `scene["vlm_caption"]` with `[MM:SS.ss - MM:SS.ss]` timestamps and keeps `"exit_state": ""` (retired) so the top-level and scene-level Phase B schema stays 100% compatible.
 
 ```json
 {
   "movie_id": "sintel",
   "movie_title": "Sintel",
   "franchise_id": "sintel",
-  "duration_sec": 888.0,
+  "duration_sec": 888.042,
   "fps": 24.0,
   "character_glossary": {
-    "Sintel": "Young woman searching for her pet dragon Scales; wears a brown cloak and carries a staff.",
-    "Scales": "Baby red dragon with a healing wing rescued by Sintel.",
-    "Shaman": "Elderly tribal healer with white dreadlocks in a desert hut."
+    "Sintel": "Young woman protagonist. Visuals by timeline: in the Ishtar flashback (02:35 - 05:35), she is a teenager with short dark-brown hair...; in the mountain/desert quest (00:25 - 02:35 and 05:35 - 08:15), she wears a dark fur-lined travel cloak...; in the final volcanic cavern act (08:15 - 12:25), she has weathered shoulder-length hair with gray streaks and facial scars.",
+    "Scales": "Small, playful baby red dragon with large amber eyes, leathery red wings, and a long tail. In the Ishtar flashback (02:58 - 05:05), his injured left wing is wrapped in a pale cloth bandage by Sintel...",
+    "Adult Dragon": "Massive, fierce winged red dragon with horns, spiked spine, and large leathery wings...",
+    "Shaman": "Elderly, clean-shaven tribal healer with long white beaded dreadlocks... VISUAL CONSTRAINT: He has NO beard or mustache...",
+    "Gatekeeper": "Fierce, bald, unmasked tribal warrior with a dark mustache and goatee... VISUAL CONSTRAINT: He does NOT wear a mask."
   },
   "external_plot_documents": [
     {
       "doc_id": "sintel_full_plot_01",
-      "title": "Full Plot & Ending Twist Analysis",
+      "title": "Time-Aligned Sub-Beat Grounding Reference",
       "tier": "full_movie",
       "start_time": 0.0,
-      "end_time": 888.0,
-      "content": "Sintel searches the world for her baby dragon Scales, only to tragically slay an adult dragon in its lair and discover from the wing scar that the adult dragon was Scales grown up..."
+      "end_time": 888.042,
+      "content": "Sintel (2010) — Time-Aligned Sub-Beat Grounding Reference:\n\nPrologue.A — Black Screen & Opening Credits Over Empty Snowy Mountains (00:00 - 00:25):\n...\nAct IV.B — The Wing-Scar & Blood-Reflection Twist and Cavern Collapse (11:15 - 12:35):\n..."
     }
   ],
   "scenes": [
     {
       "scene_id": "sintel_scene_0004",
       "scene_index": 4,
-      "start_time": 92.5,
-      "end_time": 118.0,
+      "start_time": 101.25,
+      "end_time": 131.04,
+      "duration_sec": 29.79,
       "shot_ranges": [
         {
           "shot_idx": 11,
-          "start_frame": 2220,
-          "end_frame": 2510,
-          "start_time": 92.5,
-          "end_time": 104.58
-        },
-        {
-          "shot_idx": 12,
-          "start_frame": 2510,
-          "end_frame": 2832,
-          "start_time": 104.58,
-          "end_time": 118.0
+          "parent_shot_idx": 11,
+          "is_subdivided_continuation": false,
+          "start_frame": 2430,
+          "end_frame": 2625,
+          "start_time": 101.25,
+          "end_time": 109.375
         }
       ],
       "characters_present": [
@@ -80,48 +80,27 @@ Saved at `workdir/{movie_id}/movie_knowledge_bundle.json`. Once this file and `w
       "keyframes": [
         {
           "shot_idx": 11,
-          "frame_idx": 2268,
-          "timestamp": 94.5,
-          "path": "keyframes/sintel_scene_0004_shot11_094.50s.jpg",
-          "characters_visible": [{"name": "Shaman", "color": "green", "bbox": [140, 80, 520, 690]}]
-        },
-        {
-          "shot_idx": 11,
-          "frame_idx": 2364,
-          "timestamp": 98.5,
-          "path": "keyframes/sintel_scene_0004_shot11_098.50s.jpg",
-          "characters_visible": [{"name": "Sintel", "color": "red", "bbox": [210, 95, 610, 700]}, {"name": "Shaman", "color": "green", "bbox": [50, 110, 290, 680]}]
-        },
-        {
-          "shot_idx": 12,
-          "frame_idx": 2604,
-          "timestamp": 108.5,
-          "path": "keyframes/sintel_scene_0004_shot12_108.50s.jpg",
-          "characters_visible": [{"name": "Sintel", "color": "red", "bbox": [180, 75, 590, 710]}]
+          "frame_idx": 2440,
+          "timestamp": 101.67,
+          "sharpness": 112.4,
+          "motion_delta": 5.8,
+          "path": "keyframes/sintel_scene_0004_shot11_101.67s.jpg",
+          "characters_visible": [{"name": "Shaman", "color": "green", "bbox": [140, 80, 520, 690], "score": 0.79}]
         }
       ],
       "subtitles": [
         {
-          "utt_id": "utt_0012",
-          "start_time": 94.2,
-          "end_time": 97.8,
+          "utt_id": "utt_0002",
+          "start_time": 104.2,
+          "end_time": 107.8,
           "speaker": "Shaman",
           "confidence": 0.82,
-          "source": "sdh_or_avsync",
-          "text": "What brings you to the land of the gatekeepers?"
-        },
-        {
-          "utt_id": "utt_0013",
-          "start_time": 98.5,
-          "end_time": 101.4,
-          "speaker": "Sintel",
-          "confidence": 0.89,
-          "source": "sdh_or_avsync",
-          "text": "I'm looking for a dragon. Someone took him."
+          "source": "ecapa_visual_or_manual",
+          "text": "This blade has a dark past."
         }
       ],
-      "vlm_caption": "Inside a dimly lit desert hut, an elderly tribal Shaman with white dreadlocks sits across a low brazier from Sintel, who is still recovering from exhaustion. In the first shot, Shaman leans forward and gestures toward the entrance while questioning her purpose in the land of the gatekeepers. When the camera cuts to a close-up of Sintel, her eyes narrow with grief and determination as she tightens her grip on her wooden staff and explains that her dragon was abducted...",
-      "exit_state": "Sintel remains seated across from the Shaman inside the desert hut clutching her staff, having just revealed that her dragon was kidnapped, while the Shaman listens intently."
+      "vlm_caption": "[01:41.25 - 01:49.38] Inside a dimly lit, warm-toned hut, the Shaman examines the Gatekeeper's curved spear-blade by the fire while speaking, \"This blade has a dark past.\"\n\n[01:49.38 - 01:58.17] ...",
+      "exit_state": ""
     }
   ]
 }

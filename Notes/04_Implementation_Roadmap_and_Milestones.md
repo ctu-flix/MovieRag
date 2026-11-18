@@ -90,57 +90,42 @@ Topic:
 
 ---
 
-## Milestone 2: Build the 5-Stage `Animated_AD` Extraction Pipeline (`pipeline/` & `notebooks/`)
+## Milestone 2: Build & Upgrade the Phase A Extraction Pipeline (`pipeline/` & `notebooks/`) — **[COMPLETED]**
 
-**Objective**: Create clean, modular, checkpointed CLI scripts in `pipeline/` wrapped by **2 environment-isolated Colab Pro GPU notebooks (`notebooks/`)** that mirror `Animated_AD`'s exact environment split (Visual Stack vs. Audio/VLM Stack) and communicate via Google Drive JSON checkpoints to produce `movie_knowledge_bundle.json` and `keyframes/`.
+**Objective**: Modular, checkpointed CLI scripts in `pipeline/` wrapped by **4 environment-isolated Google Colab notebooks (`notebooks/`)** producing `movie_knowledge_bundle.json` and `keyframes/` for Phase B ingestion.
 
-### Notebook 1 (`notebooks/PhaseA1_Visual_Pipeline.ipynb` — `Animated_AD/conda.yaml` Visual Environment)
+### Notebook 0 (`notebooks/PhaseA0_CharBank_Bootstrap.ipynb` — T4 GPU)
+- **Step 2.0: Credits Preview & Hybrid Cluster Character Bank (`pipeline/stage0_bootstrap_charbank.py`)**:
+  - Samples end-of-movie preview frames so the user picks exact `CREDITS_START_SEC` manually.
+  - Detects crops with `OWLv2` (`_nms_boxes`), clusters via `DINOv2` + `AgglomerativeClustering` into visual prototypes (`clusters_contact_sheet.jpg`), and exports human-labeled clusters into `char_bank/{movie_id}/raw_images/{Character}/` and `character_glossary.json`.
 
-#### Step 2.1: Shot & Scene Grouping (`pipeline/stage1_scenes.py`)
-- Input: `--video_path`, `--output_dir`, `--min_scene_sec 12`, `--max_scene_sec 30`.
-- Runs PySceneDetect (`shot_boundary_detection()`), subdivides unbroken takes $>20\text{s}$ into $15\text{s}$ sub-shots, groups contiguous shots into 15–30s Scene Windows, and writes `shots_and_scenes.json` to Google Drive.
+### Notebook 1 (`notebooks/PhaseA1_Visual_Pipeline.ipynb` — L4/T4 GPU)
+- **Step 2.1: Shot, Lineage, Scene & Micro-Beat Grouping (`pipeline/stage1_scenes.py`)**:
+  - Runs `PySceneDetect`, applies manual `credits_start_sec`, subdivides unbroken takes $>20\text{s}$ into $15\text{s}$ sub-shots with `parent_shot_idx` & `is_subdivided_continuation`, groups contiguous shots into `15–30s` Scene Windows, and partitions scenes into `4–10s` `micro_beats` (`build_micro_beats`).
+- **Step 2.2: Multi-State Character Bank (`pipeline/stage2_charbank.py`)**:
+  - Runs 75-epoch `DINOv2` contrastive fine-tuning (`finetune.py`) and builds retrieval `.npz` banks (`require_detection=False`, Farthest-Point Diversity Selection, `num_per_character=16`).
+- **Step 2.3: Upgraded Per-Shot TGRP & Motion-Adaptive 2–6 fps Keyframes (`pipeline/stage3_visual_recog.py`)**:
+  - Uses expanded OWLv2 prompts (`animated character`, `dragon or creature`, `person or warrior`), `min_box_area_ratio=0.0015`, 3 sharpest non-black seeds per third (`_select_sharpest_seed_frames`), strict seam carry-over (`carry_0` only when `is_subdivided_continuation=True`), 1-seed rescue (`OWLv2 >= 0.20`, `DINOv2 >= 0.55`), and **motion-adaptive 2–6 fps** sharp annotated keyframes (`base_fps=2.0`, `max_action_fps=6.0`, `min_sharpness_floor=10.0`, `max_keyframes_per_scene=150`, `reextract_keyframes_only`, `PINNED_KEYFRAME_TIMESTAMPS`).
 
-#### Step 2.2: Semi-Automated Character Bank (`pipeline/stage2_charbank.py`)
-- Input: `--movie_id`, `--char_bank_dir`, `--output_dir`, `--model_size giant|large`.
-- Reads exemplar images from `char_bank/{movie_id}/raw_images/{character}/` and `character_glossary.json` (or triggers optional web crawler / glossary helper if requested).
-- Runs 75-epoch `DINOv2` linear adapter contrastive fine-tuning (`finetune.py`) and extracts normalized character feature banks (`feature_extraction.py`), then frees GPU VRAM.
+### Notebook 2 (`notebooks/PhaseA2_Audio_Pipeline.ipynb` — T4 GPU)
+- **Step 2.4: Voice Bank & Speaker Attribution (`pipeline/stage4_subtitles.py`)**:
+  - Loads `.srt`/SDH or transcribes with `faster-whisper` (`large-v3`), harvests in-movie `ECAPA-TDNN` voice anchors from $s_{\text{vm}} > 0.60$ tracks (+ optional `LWTNet`), attributes dialogue, and supports pure manual `SPEAKER_OVERRIDES` via `apply_subtitle_speaker_fixes()`.
 
-#### Step 2.3: Per-Shot Visual Character Recognition & Adaptive Annotated Keyframes (`pipeline/stage3_visual_recog.py`)
-- Input: `--video_path`, `--shots_file`, `--char_features_dir`, `--output_dir`.
-- Runs `TGRP` (`OWLv2` + `SAM 2.1` bidirectional mask propagation + tripartite track matching) **per individual camera shot** with JSONL resume support, classifies tracks with the fine-tuned `DINOv2` bank, and maps shot tracks to global frame indices (`visual_tracks_per_frame.json`).
-- **Adaptive Per-Shot Keyframe Extraction**:
-  - Selects 1 sharpest frame (Laplacian variance) for short shots ($<2\text{s}$) and 1 sharpest frame every ~2s for longer shots ($\ge 2\text{s}$).
-  - Draws colored character bounding boxes ($s_{\text{vm}} > 0.45$) onto each selected shot-keyframe and saves to `workdir/{movie_id}/keyframes/` on Google Drive.
-
----
-
-### Notebook 2 (`notebooks/PhaseA2_Audio_and_VLM.ipynb` — Audio + `Qwen2.5-VL` Environment)
-
-#### Step 2.4: In-Movie Self-Bootstrapped Voice Bank & Speaker Attribution (`pipeline/stage4_subtitles.py`)
-- Input: `--video_path`, `--subtitle_path` (optional `.srt`/`.ass`), `--visual_tracks_file`, `--output_file`.
-- Parses SDH `[Character]:` tags if available; keeps `.srt` timestamps if standard `.srt` is provided; runs `WhisperX` only if no subtitle file exists.
-- **3-Step In-Movie Speaker Attribution**:
-  1. Harvests anchor voice clips from shots where a character has high visual confidence ($s_{\text{vm}} > 0.60$) and `LWTNet` confirms active lip-sync ($s_{\text{sync}} > 0.30$).
-  2. Extracts `ECAPA-TDNN` embeddings from those anchor clips to construct the per-character In-Movie Voice Bank.
-  3. Runs `ECAPA-TDNN` audio matching ($c_a$) + `LWTNet` visual enhancement (for $c_a < 0.35$) + Stage-2 LLM dialogue refinement to output `attributed_subtitles.json` to Google Drive, then flushes GPU VRAM.
-
-#### Step 2.5: Two-Pass Character-Grounded VLM Scene Captioner (`pipeline/stage5_vlm_caption.py`)
-- Input: `--scenes_file`, `--keyframes_dir`, `--visual_tracks_file`, `--subtitles_file`, `--glossary_file`, `--output_bundle`.
-- For each Scene Window:
-  - **Pass 1 (100% Vision Attention)**: Feeds the scene's annotated shot-keyframes + color-to-character legend + static `character_glossary.json` + speaker-attributed subtitles + previous scene's `exit_state` (& last 2–3 subtitle lines) into `Qwen2.5-VL-7B-Instruct` (or `MiniCPM-V-2_6-int4`) to generate a rich `300–600` token `vlm_caption`.
-  - **Pass 2 (Exit-State Extraction)**: Feeds Pass 1's output + the final keyframe of the scene + last 2–3 subtitle lines to extract a 2–3 sentence `exit_state` for the next scene.
-- Writes the final `movie_knowledge_bundle.json` to Google Drive.
+### Notebook 3 (`notebooks/PhaseA3_VLM_Captioning.ipynb` — Free CPU Runtime)
+- **Step 2.5: Micro-Beat `deepseek-flash` VLM Captioner & `$0` Merge (`pipeline/stage5_vlm_caption.py`)**:
+  - Runs single-pass `deepseek-flash` (`thinking: {"type": "disabled"}`, `960px` width, `max_tokens=450`) across `4–10s` micro-beats (`vlm_beats.jsonl` resume checkpoint).
+  - Applies visual overlap frames + `[ALREADY HAPPENED IN PREVIOUS BEAT]` continuity (retiring `[EXIT_STATE]`), timeline-gated visual-first `character_glossary.json` with `VISUAL CONSTRAINT`s, `appearance_windows.json` filtering (`out_of_window_min_score=0.60`), phase-granular `external_plot.txt` sub-blocks, low-level telemetry alerts (`sharpness < 1.0`, 0 tracked characters), duration-scaled word budgets (`20–40` / `60–110` / `100–180`), and the `ANTI-PREMATURE-CLOSURE RULE`.
+  - Deterministically merges beats back into `15–30s` scenes (`$0`) and writes `movie_knowledge_bundle.json`.
 
 ---
 
-## Milestone 3: End-to-End Validation on `Sintel.mp4` & Scale-Up to `CMD-AM`
+## Milestone 3: Final Phase A Run on `Sintel.mp4`, Phase B/C Implementation & Validation — **[IN PROGRESS]**
 
-### Step 3.1: Set Up the 2 Phase-A Colab Notebooks & Clean Up `VideoRAG.ipynb`
-- Create `notebooks/PhaseA1_Visual_Pipeline.ipynb` (Stages A1–A3: `PySceneDetect`, `OWLv2`, `SAM 2.1`, `DINOv2`) and `notebooks/PhaseA2_Audio_and_VLM.ipynb` (Stages A4–A5: `WhisperX`, `LWTNet`, `ECAPA-TDNN`, `Qwen2.5-VL-7B`), reading/writing intermediate artifacts to `/content/drive/MyDrive/MovieRAG/{movie_id}/`.
-- Clean up `VideoRAG.ipynb` (removing legacy `torch==2.1.2` downgrade and `ImageBind` / `pytorchvideo` cells) so it serves as the **Phase B & C Indexing & Interactive Chat Notebook** (calling `videorag.insert_knowledge_bundle(...)` and testing multi-turn `chat_history` + tool-call traces alongside `api/app.py`).
+### Step 3.1: Colab Notebooks Setup — **[COMPLETED]**
+- Created and configured `PhaseA0_CharBank_Bootstrap.ipynb`, `PhaseA1_Visual_Pipeline.ipynb`, `PhaseA2_Audio_Pipeline.ipynb`, and `PhaseA3_VLM_Captioning.ipynb`.
 
-### Step 3.2: End-to-End Evaluation on `Sintel.mp4` (15 mins) & `CMD-AM` (`Sing` / `Kung Fu Panda`)
-- Verify visual grounding accuracy (characters `Sintel`, `Scales`, `Shaman` named accurately in VLM scene captions and speaker-attributed subtitles).
-- Verify Turn-0 zero-hop answers vs. Rounds 1–3 multi-hop tool calls (`search_scenes`, `get_character_history`, `get_adjacent_scenes`, `inspect_keyframes`).
-- Verify timestamp cutoff precision across early, middle, and late timestamps with `spoiler_free=True` vs. `spoiler_free=False`.
+### Step 3.2: Re-Run Full Stage A5 Bundle & End-to-End Phase B/C Validation — **[NEXT UP]**
+- Run `PhaseA3_VLM_Captioning.ipynb` (Cell 6 with `RESTART_STAGE5 = True` and the updated `char_bank/sintel/` + `stage5_vlm_caption.py` patch) to regenerate the clean `movie_knowledge_bundle.json` for *Sintel*.
+- Implement **Milestone 1** across `MovieRAG/videorag/` (`base.py`, `_llm.py`, `vdb_nanovectordb.py`, `videorag.py`, `_op.py`) and `api/app.py`, and clean up `VideoRAG.ipynb` (`torch==2.1.2` / `ImageBind` removal).
+- Verify Turn-0 zero-hop answers, Rounds 1–3 agent tool calls (`search_scenes`, `get_character_history`, `get_adjacent_scenes`, `inspect_keyframes`), and timestamp/spoiler isolation across early, middle, and late timestamps with `spoiler_free=True` vs. `spoiler_free=False`.
 - Scale to a full-length `CMD-AM` animated movie (`Sing` or `Kung Fu Panda`) to benchmark end-to-end ingestion time and retrieval latency.

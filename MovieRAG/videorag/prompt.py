@@ -134,7 +134,7 @@ PROMPTS[
 ] = """It appears some entities may have still been missed.  Answer YES | NO if there are still entities that need to be added.
 """
 
-PROMPTS["DEFAULT_ENTITY_TYPES"] = ["organization", "person", "geo", "event"]
+PROMPTS["DEFAULT_ENTITY_TYPES"] = ["character", "person", "organization", "location", "object", "event"]
 PROMPTS["DEFAULT_TUPLE_DELIMITER"] = "<|>"
 PROMPTS["DEFAULT_RECORD_DELIMITER"] = "##"
 PROMPTS["DEFAULT_COMPLETION_DELIMITER"] = "<|COMPLETE|>"
@@ -439,4 +439,59 @@ Please provide your answer in JSON format as follows:
 Key points:
 1. Ensure that the "Answer" reflects the correct label format.
 2. Structure the "Explanation" for clarity, using Markdown for any necessary formatting.
+"""
+
+PROMPTS[
+    "chapter_summary_generation"
+] = """You are an expert narrative analyst for an animated film knowledge base.
+Summarize the following consecutive scenes [{start_mmss} - {end_mmss}] of "{movie_title}" into a cohesive 1-2 paragraph progressive chapter summary.
+
+STRICT SPOILER-ISOLATION RULES:
+1. Base your chapter summary ONLY on the visual descriptions and dialogue contained in the provided scenes below.
+2. NEVER mention, foreshadow, or infer any plot twists, character fates, or events that occur after {end_mmss}.
+3. Preserve key character actions, locations, object exchanges, and spoken revelations with `[MM:SS - MM:SS]` timestamp references.
+4. Begin the first line with a short descriptive title formatted as: `Chapter {chapter_num} [{start_mmss} - {end_mmss}]: <Short Title>` followed by the 1-2 paragraph narrative summary.
+
+---Scenes in Chapter {chapter_num} [{start_mmss} - {end_mmss}]---
+{scenes_text}
+
+---Output---
+"""
+
+PROMPTS[
+    "query_coref_resolution"
+] = """Given the recent conversation history and the user's latest follow-up question about an animated movie, rewrite the latest question into a standalone, self-contained search query that resolves all pronouns ("he", "she", "they", "it", "that", "there", "him", "her") and implicit references.
+If the latest question is already self-contained, return it unchanged. Output ONLY the rewritten query text with no extra commentary.
+
+---Recent Conversation History---
+{chat_history_text}
+
+---Latest User Question---
+{input_text}
+
+---Standalone Rewritten Query---
+"""
+
+PROMPTS[
+    "movierag_agent_system_prompt"
+] = """You are MovieRAG, an expert, spoiler-aware multimodal film assistant for the animated movie "{movie_title}".
+
+{spoiler_guardrail}
+
+You have been provided with **Turn-0 Pre-Retrieved Knowledge** below (`<viewer_state>`, `<current_scene_at_T_user>`, `<graph_entities_and_relations_up_to_T_user>`, and `<retrieved_scene_and_chapter_chunks_up_to_T_user>`).
+
+### How to Answer or Use Tools
+1. **Check Turn-0 Context First**: If the Turn-0 context already contains sufficient grounded evidence to answer the user's question accurately, synthesize your final answer immediately without calling any tools (0 tool calls).
+2. **When to Call Tools (Up to {max_tool_rounds} Rounds)**:
+   - Call `search_scenes(query, start_time, end_time)` if you need to locate specific scenes or events not present in the Turn-0 chunks.
+   - Call `get_character_history(character_name)` if you need a character's complete chronological actions and 1-hop relationships up to the viewer's timestamp.
+   - Call `get_adjacent_scenes(scene_id, before, after)` if you need to see what happened immediately before or after a specific scene.
+   - Call `inspect_keyframes(scene_id, visual_question)` when the user asks about a fine-grained visual detail (e.g., exact appearance, object held, posture, background detail, facial expression) that is not explicitly stated in the scene text caption.
+3. **Citation & Grounding Rules**:
+   - Ground every claim in the retrieved scenes, dialogues, keyframes, or graph histories. Do not fabricate events.
+   - {citation_instruction}
+   - Format your response in clear Markdown matching the requested style: {response_type}.
+
+---Turn-0 Pre-Retrieved Knowledge---
+{turn0_context}
 """

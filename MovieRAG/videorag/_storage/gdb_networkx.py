@@ -1,11 +1,139 @@
 import html
 import json
 import os
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Union, cast
-import networkx as nx
 import numpy as np
+
+try:
+    import networkx as nx
+except ImportError:
+
+    class _FallbackNXGraph:
+        """Pure-Python fallback for nx.Graph when networkx is not installed in system Python."""
+
+        def __init__(self):
+            self.nodes: dict[str, dict] = {}
+            self._adj: dict[str, dict[str, dict]] = defaultdict(dict)
+
+        def is_directed(self) -> bool:
+            return False
+
+        def number_of_nodes(self) -> int:
+            return len(self.nodes)
+
+        def number_of_edges(self) -> int:
+            seen = set()
+            for u, nbrs in self._adj.items():
+                for v in nbrs:
+                    seen.add(tuple(sorted((u, v))))
+            return len(seen)
+
+        def has_node(self, node_id: str) -> bool:
+            return node_id in self.nodes
+
+        def has_edge(self, u: str, v: str) -> bool:
+            return u in self._adj and v in self._adj[u]
+
+        def add_node(self, node_id: str, **attr):
+            if node_id not in self.nodes:
+                self.nodes[node_id] = {}
+            self.nodes[node_id].update(attr)
+
+        def add_edge(self, u: str, v: str, **attr):
+            self.add_node(u)
+            self.add_node(v)
+            shared = self._adj[u].get(v, {})
+            shared.update(attr)
+            self._adj[u][v] = shared
+            self._adj[v][u] = shared
+
+        def degree(self, node_id: str) -> int:
+            return len(self._adj.get(node_id, {}))
+
+        def edges(self, nbunch=None, data: bool = False):
+            if nbunch is not None:
+                return [(nbunch, v) for v in self._adj.get(nbunch, {})]
+            out = []
+            seen = set()
+            for u, nbrs in self._adj.items():
+                for v, d in nbrs.items():
+                    key = tuple(sorted((u, v)))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append((u, v, d) if data else (u, v))
+            return out
+
+        @property
+        def _edges_view(self):
+            class _EdgeLookup:
+                def __init__(self, adj):
+                    self._adj = adj
+
+                def get(self, pair, default=None):
+                    u, v = pair
+                    return self._adj.get(u, {}).get(v, default)
+
+            return _EdgeLookup(self._adj)
+
+    class _FallbackNXModule:
+        Graph = _FallbackNXGraph
+
+        @staticmethod
+        def write_graphml(graph: _FallbackNXGraph, file_name: str):
+            root = ET.Element("graphml")
+            g_el = ET.SubElement(root, "graph", id="G", edgedefault="undirected")
+            for n_id, attrs in graph.nodes.items():
+                n_el = ET.SubElement(g_el, "node", id=str(n_id))
+                for k, v in attrs.items():
+                    d_el = ET.SubElement(n_el, "data", key=str(k))
+                    d_el.text = json.dumps({"t": type(v).__name__, "v": v}, ensure_ascii=False)
+            for u, v, attrs in graph.edges(data=True):
+                e_el = ET.SubElement(g_el, "edge", source=str(u), target=str(v))
+                for k, val in attrs.items():
+                    d_el = ET.SubElement(e_el, "data", key=str(k))
+                    d_el.text = json.dumps({"t": type(val).__name__, "v": val}, ensure_ascii=False)
+            tree = ET.ElementTree(root)
+            tree.write(file_name, encoding="utf-8", xml_declaration=True)
+
+        @staticmethod
+        def read_graphml(file_name: str) -> _FallbackNXGraph:
+            g = _FallbackNXGraph()
+            tree = ET.parse(file_name)
+            root = tree.getroot()
+            for g_el in root.findall(".//graph"):
+                for n_el in g_el.findall("node"):
+                    n_id = n_el.attrib["id"]
+                    attrs = {}
+                    for d_el in n_el.findall("data"):
+                        k = d_el.attrib["key"]
+                        raw = d_el.text or ""
+                        try:
+                            parsed = json.loads(raw)
+                            attrs[k] = parsed["v"] if isinstance(parsed, dict) and "v" in parsed else parsed
+                        except Exception:
+                            attrs[k] = raw
+                    g.add_node(n_id, **attrs)
+                for e_el in g_el.findall("edge"):
+                    u = e_el.attrib["source"]
+                    v = e_el.attrib["target"]
+                    attrs = {}
+                    for d_el in e_el.findall("data"):
+                        k = d_el.attrib["key"]
+                        raw = d_el.text or ""
+                        try:
+                            parsed = json.loads(raw)
+                            attrs[k] = parsed["v"] if isinstance(parsed, dict) and "v" in parsed else parsed
+                        except Exception:
+                            attrs[k] = raw
+                    g.add_edge(u, v, **attrs)
+            return g
+
+    nx = _FallbackNXModule()
+
 
 from .._utils import logger
 from ..base import (
@@ -117,7 +245,8 @@ class NetworkXStorage(BaseGraphStorage):
     async def get_edge(
         self, source_node_id: str, target_node_id: str
     ) -> Union[dict, None]:
-        return self._graph.edges.get((source_node_id, target_node_id))
+        edges_obj = getattr(self._graph, "_edges_view", None) or self._graph.edges
+        return edges_obj.get((source_node_id, target_node_id))
 
     async def get_node_edges(self, source_node_id: str):
         if self._graph.has_node(source_node_id):

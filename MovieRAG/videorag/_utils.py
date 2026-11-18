@@ -11,10 +11,43 @@ from hashlib import md5
 from typing import Any, Union
 
 import numpy as np
-import tiktoken
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 
 logger = logging.getLogger("nano-graphrag")
 ENCODER = None
+
+
+class _FallbackWordTokenizer:
+    """Offline fallback tokenizer if tiktoken is unavailable or lacks cached BPE files."""
+
+    def encode(self, content: str) -> list[str]:
+        return re.findall(r"\S+|\s+", content or "")
+
+    def decode(self, tokens: list) -> str:
+        return "".join(str(t) for t in tokens)
+
+    def encode_batch(self, docs: list[str], num_threads: int = 1) -> list[list[str]]:
+        return [self.encode(d) for d in docs]
+
+    def decode_batch(self, batch: list[list]) -> list[str]:
+        return [self.decode(t) for t in batch]
+
+
+def get_tiktoken_encoder(model_name: str = "gpt-4o"):
+    global ENCODER
+    if ENCODER is None:
+        if tiktoken is not None:
+            try:
+                ENCODER = tiktoken.encoding_for_model(model_name)
+            except Exception:
+                ENCODER = _FallbackWordTokenizer()
+        else:
+            ENCODER = _FallbackWordTokenizer()
+    return ENCODER
+
 
 
 def always_get_an_event_loop() -> asyncio.AbstractEventLoop:
@@ -50,19 +83,13 @@ def convert_response_to_json(response: str) -> dict:
 
 
 def encode_string_by_tiktoken(content: str, model_name: str = "gpt-4o"):
-    global ENCODER
-    if ENCODER is None:
-        ENCODER = tiktoken.encoding_for_model(model_name)
-    tokens = ENCODER.encode(content)
-    return tokens
+    encoder = get_tiktoken_encoder(model_name)
+    return encoder.encode(content)
 
 
 def decode_tokens_by_tiktoken(tokens: list[int], model_name: str = "gpt-4o"):
-    global ENCODER
-    if ENCODER is None:
-        ENCODER = tiktoken.encoding_for_model(model_name)
-    content = ENCODER.decode(tokens)
-    return content
+    encoder = get_tiktoken_encoder(model_name)
+    return encoder.decode(tokens)
 
 
 def truncate_list_by_token_size(list_data: list, key: callable, max_token_size: int):

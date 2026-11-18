@@ -1,6 +1,6 @@
 # Input Preparation Guide (`Phase A`)
 
-> Quick reference for preparing your movie video, character bank images, and Google Drive layout before running `PhaseA1_Visual_Pipeline.ipynb`.
+> Quick reference for preparing your movie video, character bank images, timeline gates, and Google Drive layout before running `PhaseA0_CharBank_Bootstrap.ipynb` / `PhaseA1_Visual_Pipeline.ipynb`.
 
 ---
 
@@ -15,19 +15,20 @@ MyDrive/MovieRAG/
 │   └── sintel.srt                    # Optional (.srt or SDH .srt for Notebook 2)
 └── char_bank/
     └── sintel/
-        ├── character_glossary.json   # 1-sentence spoiler-free visual/role description per character
-        └── raw_images/
+        ├── character_glossary.json   # Visual-first + timeline-gated + negative constraints
+        ├── appearance_windows.json   # Optional {Character: [[start_s, end_s], ...]} gates
+        ├── external_plot.txt         # Optional time-aligned (MM:SS - MM:SS) grounding synopsis
+        └── raw_images/               # Auto-populated by PhaseA0 clustering or manual frames
             ├── Sintel/
-            │   ├── Sintel_0.png      # Anchor image (clear front/3-quarter view)
-            │   ├── Sintel_1.png      # 5-8 varied shots (full-body, medium, side, close-up)
+            │   ├── Sintel_0.png
             │   └── ...
             ├── Scales/
-            │   ├── Scales_0.png
-            │   └── ...
-            └── Shaman/
-                ├── Shaman_0.png
-                └── ...
+            ├── Adult Dragon/
+            ├── Shaman/
+            └── Gatekeeper/
 ```
+
+*(Tip: You can run **`PhaseA0_CharBank_Bootstrap.ipynb`** first on a T4 GPU to inspect the end-of-movie `CREDITS_START_SEC` frame grid and automatically harvest & cluster crops with `OWLv2` + `DINOv2` into `clusters_contact_sheet.jpg`, then assign cluster IDs directly into `raw_images/`.)*
 
 ---
 
@@ -51,14 +52,17 @@ In Stage A2 & A3, `OWLv2` detects the **whole visible character bounding box** i
 
 ---
 
-## 3. `character_glossary.json` Rules
+## 3. `character_glossary.json` & `appearance_windows.json` Rules
 
-Keep descriptions to **1 concise sentence** describing **visual appearance + initial role** (never include late-movie plot twists or spoilers):
+- Write **visual-first descriptions** grouped by timeline state (outfit/hair/weapon changes), **never** include ending plot twists (`"grown into the Adult Dragon"`), and add explicit **`VISUAL CONSTRAINT:`** negative rules whenever characters have commonly misread traits (e.g., `"He does NOT wear a mask"`, `"He has NO beard or mustache"`).
+- Add **`appearance_windows.json`** (`{"Character": [[start_sec, end_sec], ...]}`) so Stage A5 gates out inactive characters from unrelated scenes and ignores low-confidence out-of-window visual tracker false positives (`score < 0.60`).
 
 ```json
 {
-  "Sintel": "Young woman warrior and protagonist searching for her companion dragon Scales; has short dark-brown hair, wears a weathered brown tunic and desert cloak, and carries a wooden staff.",
-  "Scales": "Small, playful baby red dragon with large amber eyes and an injured wing bandaged and nursed back to health by Sintel.",
-  "Shaman": "Elderly tribal healer and gatekeeper with long white dreadlocks and ceremonial robes who questions Sintel inside a desert hut."
+  "Sintel": "Young woman protagonist. Visuals by timeline: in Ishtar (02:35 - 05:35), teenager with short dark-brown hair and sleeveless tunic; in the quest (00:25 - 02:35, 05:35 - 08:15), fur-lined travel cloak; in the cavern (08:15 - 12:25), weathered shoulder-length hair with gray streaks.",
+  "Scales": "Small, playful baby red dragon with large amber eyes and an injured wing wrapped in a pale cloth bandage during the Ishtar flashback (02:58 - 05:05).",
+  "Adult Dragon": "Massive winged red dragon with horns and spiked spine (05:00 - 05:30, 09:15 - 11:55).",
+  "Shaman": "Elderly, clean-shaven tribal healer with long white beaded dreadlocks and white ceremonial face paint. VISUAL CONSTRAINT: He has NO beard or mustache—do not mistake dreadlocks or chin shadows for facial hair.",
+  "Gatekeeper": "Fierce, bald, unmasked tribal warrior with dark mustache and goatee and wooden banner poles strapped to his back (00:35 - 01:26). VISUAL CONSTRAINT: He does NOT wear a mask."
 }
 ```

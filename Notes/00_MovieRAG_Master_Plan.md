@@ -1,5 +1,5 @@
 ---
-Date: 2026-11-11
+Date: 2026-11-18
 Top Level:
   - "[[_tech_]]"
 Topic:
@@ -11,15 +11,15 @@ Topic:
 # MovieRAG: Animated Movie Multimodal Knowledge Base & Spoiler-Aware RAG
 
 > **Master Architecture & Design Index**
-> This note serves as the central hub for the end-to-end MovieRAG architecture. It connects the offline animated character recognition pipeline (`Animated_AD`) with our spoiler-aware, multi-resolution, agentic `MovieRAG` engine.
+> This note serves as the central hub for the end-to-end MovieRAG architecture. It connects the offline animated character recognition pipeline (`Animated_AD` + `DeepSeek-Flash` micro-beat VLM) with our spoiler-aware, multi-resolution, agentic `MovieRAG` engine.
 
 ---
 
 ## Sub-Notes Index
-1. **[[01_PhaseA_Animated_AD_Pipeline]]** — Shot-aligned scene windowing, semi-automated visual character bank (`DINOv2` + `character_glossary.json`), per-shot TGRP tracking (`OWLv2` + `SAM 2.1`), adaptive per-shot annotated keyframe sampling, hybrid speaker attribution (`SDH` / `WhisperX` + `LWTNet` + `ECAPA-TDNN`), and 2-pass character-grounded VLM scene captioning.
-2. **[[02_Data_Handoff_and_Storage_Schemas]]** — Exact JSON specifications for `movie_knowledge_bundle.json`, 1-Scene = 1-Chunk `TextChunkSchema`, `NanoVectorDB` metadata fields (including time-sliced rich `entities_vdb`), and time-sliced `NetworkX` graph node/edge schemas.
+1. **[[01_PhaseA_Animated_AD_Pipeline]]** — Hybrid cluster + human character bank (`Stage A0`), shot-aligned scene windowing + 4–10s micro-beats + manual credits cutoff (`Stage A1`), multi-state `DINOv2` bank (`Stage A2`), sharp-seed TGRP tracking with seam carry-over + 1-seed rescue + 2–6 fps motion-adaptive annotated keyframes (`Stage A3`), hybrid speaker attribution + manual overrides (`Stage A4`), and single-pass micro-beat `deepseek-flash` VLM captioning with telemetry/anti-closure rules + `$0` deterministic scene merge (`Stage A5`).
+2. **[[02_Data_Handoff_and_Storage_Schemas]]** — Exact JSON specifications for `movie_knowledge_bundle.json` (and `shots_and_scenes.json` `micro_beats`), 1-Scene = 1-Chunk `TextChunkSchema`, `NanoVectorDB` metadata fields (including time-sliced rich `entities_vdb`), and time-sliced `NetworkX` graph node/edge schemas.
 3. **[[03_Spoiler_Aware_GraphRAG_and_Retrieval]]** — Dual-layer 3-tier knowledge indexing (`scene`, `chapter`, `full_movie`), time-sliced entity/relation merging, straddle-safe timestamp filtering (`T_user`), **Multi-Turn Conversation Memory (`chat_history`)**, and the **Hybrid Turn-0 GraphRAG + Bounded Agentic Tool-Calling Loop (`DeepSeek-V3` + `inspect_keyframes` Vision Sub-Tool)**.
-4. **[[04_Implementation_Roadmap_and_Milestones]]** — Step-by-step file modification blueprint across `MovieRAG/`, `api/app.py` (Standalone FastAPI Chatbot Service), and `Animated_AD/`, dependency cleanup, and validation milestones starting with `Sintel.mp4`.
+4. **[[04_Implementation_Roadmap_and_Milestones]]** — Step-by-step file modification blueprint across `pipeline/` + `notebooks/` (Phase A — Completed), `MovieRAG/`, and `api/app.py` (Phase B & C — Next Up), plus validation milestones starting with `Sintel.mp4`.
 
 ---
 
@@ -27,12 +27,12 @@ Topic:
 
 | Pillar | Decision Locked In | Why It Solves Previous Bottlenecks |
 | :--- | :--- | :--- |
-| **1. Per-Shot Annotated Keyframes + 2-Pass VLM Captioning** | Sample 1 sharpest frame per short shot ($<2\text{s}$) and 1 per ~2s in longer shots, draw colored character bounding boxes, and run a **2-pass VLM workflow** (`Pass 1`: full vision attention for a rich `300–600` token scene description; `Pass 2`: concise 2–3 sentence `exit_state` for next-scene continuity). | Captures every camera cut without motion blur, prevents previous-scene temporal bleed, and keeps 100% of VLM vision attention on the current scene. |
-| **2. Per-Shot Tracking $\rightarrow$ Grouped Scene Windows** | Keep `TGRP` (`OWLv2` + `SAM 2.1`) running per camera shot (respecting hard cuts), then group contiguous shots into **15–30s semantic scenes**. | Prevents `SAM 2.1` pixel masks from breaking across hard camera cuts while giving the VLM and RAG index complete multi-shot narrative scenes. |
-| **3. 3-Tier Multi-Resolution Index (`1 Scene = 1 Chunk`)** | **Tier 1 (`scene`)**: 1 Scene = 1 rich chunk (`400–1,000+` tokens of Pass-1 visual breakdown + speaker-tagged subtitles, no multi-scene squeezing).<br>**Tier 2 (`chapter`)**: 5–10 min progressive summaries.<br>**Tier 3 (`full_movie`)**: External plot/theme analysis (`end_time = duration`, unlocked only when `spoiler_free = False`). | Preserves exhaustive visual and subtitle detail per scene while keeping `external_plot` strictly isolated in Tier 3 so early tiers never leak spoilers. |
+| **1. Motion-Adaptive 2–6 fps Keyframes + Micro-Beat `deepseek-flash` Captioning** | Sample sharp keyframes at **2–6 fps** (`base_fps=2.0`, `max_action_fps=6.0`, Laplacian floor `10.0`), partition each 15–30s scene into **4–10s micro-beats**, call `deepseek-flash` (`thinking: disabled`, `960px` width, `max_tokens=450`) with visual overlap (`[Context Only]`) + previous beat text + telemetry/anti-closure guards + time-gated visual-first glossary, then deterministically merge beats back into scenes (`$0`). | Eliminates sparse keyframe blind spots, Qwen repetition loops, premature fight completion, `[EXIT_STATE]` fluff, and absent-character/spoiler leakage while cutting VLM cost to ~\$0.20–\$0.30/movie. |
+| **2. Per-Shot TGRP (Unbroken Take Carry-Over + 1-Seed Rescue) $\rightarrow$ Scenes & Micro-Beats** | Run `TGRP` (`OWLv2` creature/warrior prompts, `min_box_area_ratio=0.0015`, 3 sharpest seeds) per shot, reset SAM 2.1 at real hard cuts, carry over boundary boxes **strictly across `is_subdivided_continuation` seams** of $>20\text{s}$ takes, rescue 1-seed tracks (`OWLv2 >= 0.20`, `DINOv2 >= 0.55`), and group shots into 15–30s scenes + 4–10s micro-beats. | Prevents SAM 2.1 masks from breaking on cuts, keeps bounding boxes alive across 15s take subdivisions, and improves recall on distant wide/dark shots. |
+| **3. 3-Tier Multi-Resolution Index (`1 Scene = 1 Chunk`)** | **Tier 1 (`scene`)**: 1 Scene = 1 rich chunk (timestamped merged micro-beat VLM breakdown + speaker-tagged subtitles, no multi-scene squeezing).<br>**Tier 2 (`chapter`)**: 5–10 min progressive summaries.<br>**Tier 3 (`full_movie`)**: Time-aligned `external_plot_documents` (`end_time = duration`, unlocked only when `spoiler_free = False`). | Preserves exhaustive visual and subtitle detail per scene while keeping `external_plot` strictly isolated in Tier 3 so early tiers never leak spoilers. |
 | **4. Time-Sliced Knowledge Graph & Rich `entities_vdb`** | Store `temporal_descriptions: [{start_time, end_time, tier, description}]` on every graph node/edge AND store time-sliced rich entity embeddings in `entities_vdb` with `start_time`/`end_time` metadata. | Gives `entities_vdb` full semantic description recall while strictly blocking future character twists or unintroduced entities when `spoiler_free = True`. |
 | **5. Hybrid Turn-0 GraphRAG + Agentic Tool-Calling Loop** | **Turn 0**: Auto-injects the Active Scene at `T_user` + Spoiler-Filtered Original GraphRAG output (Vector Chunks + Entity Rewrite $\rightarrow$ 1-Hop Graph Co-Occurrence Scenes + Graph Entity/Edge Histories $\le T_{\text{user}}$).<br>**Rounds 1–3**: `DeepSeek-V3` either answers immediately (0 tool calls) or invokes spoiler-gated tools (`search_scenes`, `get_character_history`, `get_adjacent_scenes`, `inspect_keyframes`). | Combines zero-hop speed for ~80% of queries with multi-hop graph/timeline investigation and on-demand Vision API keyframe inspection (`Option A`) for hard queries. |
-| **6. Hybrid Compute & 2-Notebook Colab Split** | **Notebook 1 (`PhaseA1_Visual_Pipeline.ipynb`)**: `Animated_AD/conda.yaml` visual stack (`PySceneDetect`, `OWLv2`, `SAM 2.1`, `DINOv2`) $\rightarrow$ `shots_and_scenes.json`, `visual_tracks_per_frame.json`, `keyframes/`.<br>**Notebook 2 (`PhaseA2_Audio_and_VLM.ipynb`)**: Audio + VLM stack (`WhisperX`, `LWTNet`, `ECAPA-TDNN`, `Qwen2.5-VL-7B`) $\rightarrow$ `movie_knowledge_bundle.json`.<br>**Phase B & C (Local CPU)**: `DeepSeek API` + local `nomic-embed-text` + Vision Sub-Tool API + FastAPI (`api/app.py`). | Eliminates CUDA/PyTorch dependency clashes between `SAM 2.1`/`xformers` and `WhisperX`/`SpeechBrain`/`Qwen2.5-VL`, while keeping zero GPU requirements for indexing and live chatbot serving. |
+| **6. Hybrid Compute & 4-Notebook Colab Split** | **NB0 (`PhaseA0_CharBank_Bootstrap.ipynb`)**: T4 GPU credits preview & hybrid OWLv2+DINOv2 clustering + human labeling.<br>**NB1 (`PhaseA1_Visual_Pipeline.ipynb`)**: Visual stack (`PySceneDetect`, `OWLv2`, `SAM 2.1`, `DINOv2`) $\rightarrow$ `shots_and_scenes.json`, `visual_tracks_per_frame.json`, `keyframes/`.<br>**NB2 (`PhaseA2_Audio_Pipeline.ipynb`)**: Audio stack (`faster-whisper`, `LWTNet`, `ECAPA-TDNN`) $\rightarrow$ `attributed_subtitles.json`.<br>**NB3 (`PhaseA3_VLM_Captioning.ipynb`)**: Free Colab **CPU** runtime calling `deepseek-flash` API $\rightarrow$ `movie_knowledge_bundle.json`.<br>**Phase B & C (Local CPU)**: `DeepSeek API` + local embeddings + FastAPI (`api/app.py`). | Eliminates CUDA/PyTorch dependency clashes (`SAM 2.1`/`xformers` vs audio), runs Stage A5 on a free CPU runtime with zero GPU cost, and keeps indexing/serving CPU-only. |
 
 ---
 
@@ -43,19 +43,26 @@ flowchart TD
     subgraph Inputs["1. Movie Inputs & External Context"]
         RAW_VID["Raw Animated Movie (.mp4 / .mkv)"]
         SUBS["Optional Subtitles (.srt / .ass SDH)"]
-        CHAR_DIR["Character Bank Folder<br/>char_bank/{movie_id}/raw_images/{character}/<br/>+ character_glossary.json"]
-        EXT_DOC["External Full-Movie Plot/Themes<br/>(Strictly for Tier 3 full_movie)"]
+        CHAR_DIR["Character Bank Folder<br/>char_bank/{movie_id}/raw_images/{character}/<br/>+ character_glossary.json (visual + negative constraints)<br/>+ appearance_windows.json + external_plot.txt"]
     end
 
-    subgraph StageA1["2A. Colab Notebook 1: Visual Pipeline (Animated_AD conda.yaml Stack)"]
-        SHOT["Stage A1: Shot & Scene Boundary Detection<br/>PySceneDetect Shots -> Grouped 15-30s Scene Windows"]
-        CBANK["Stage A2: Character Bank Builder<br/>OWLv2 + SAM 2.1 + DINOv2 Contrastive Fine-Tuning (75 epochs)"]
-        VIS_TRACK["Stage A3: Per-Shot Visual Tracking & Adaptive Keyframes<br/>TGRP (OWLv2 + SAM 2.1 per shot) + DINOv2 ID<br/>+ Annotated Shot Keyframes (1/short shot, 1 per ~2s long shot)"]
+    subgraph StageA0["2A. NB0: PhaseA0_CharBank_Bootstrap.ipynb (T4 GPU)"]
+        CRED["End-of-Movie Preview -> Manual CREDITS_START_SEC"]
+        CLUST["OWLv2 + DINOv2 Clustering -> Contact Sheet & Human Labels"]
     end
 
-    subgraph StageA2["2B. Colab Notebook 2: Audio & VLM Pipeline (Audio + Qwen2.5-VL Stack)"]
-        AUD_RECOG["Stage A4: In-Movie Voice Bank & Speaker Attribution<br/>Parse SDH / WhisperX + LWTNet Anchor Harvesting + ECAPA-TDNN"]
-        VLM_CAP["Stage A5: 2-Pass Grounded VLM Scene Captioning<br/>Pass 1: Annotated Shot Keyframes + Subtitles + Prev exit_state -> Rich Description<br/>Pass 2: Extract 2-3 Sentence exit_state for Next Scene"]
+    subgraph StageA1["2B. NB1: PhaseA1_Visual_Pipeline.ipynb (L4/T4 GPU)"]
+        SHOT["Stage A1: Shot & Scene Windowing + 4-10s Micro-Beats<br/>PySceneDetect + parent_shot_idx Lineage + Credits Cutoff"]
+        CBANK["Stage A2: Multi-State Character Bank<br/>75-Epoch DINOv2 InfoNCE + Farthest-Point Prototypes (16/char)"]
+        VIS_TRACK["Stage A3: TGRP + Carry-Over + 1-Seed Rescue<br/>& Motion-Adaptive 2-6 fps Annotated Keyframes"]
+    end
+
+    subgraph StageA2["2C. NB2: PhaseA2_Audio_Pipeline.ipynb (T4 GPU)"]
+        AUD_RECOG["Stage A4: Voice Bank & Speaker Attribution<br/>SDH / faster-whisper + LWTNet + ECAPA-TDNN + Manual Overrides"]
+    end
+
+    subgraph StageA3["2D. NB3: PhaseA3_VLM_Captioning.ipynb (CPU Only)"]
+        VLM_CAP["Stage A5: Micro-Beat deepseek-flash API Captioner<br/>Overlap Frames + Telemetry + Anti-Closure + Window-Gated Glossary<br/>-> Deterministic $0 Scene Merge"]
         BUNDLE["Handoff Artifact on Google Drive (rclone)<br/>movie_knowledge_bundle.json + keyframes/"]
     end
 
@@ -74,6 +81,7 @@ flowchart TD
         TOOLS["Spoiler-Gated Tools:<br/>search_scenes | get_character_history | get_adjacent_scenes | inspect_keyframes (Vision API)"]
     end
 
+    RAW_VID --> CRED --> CLUST --> CHAR_DIR
     RAW_VID --> SHOT
     CHAR_DIR --> CBANK
     SHOT --> VIS_TRACK
@@ -86,7 +94,6 @@ flowchart TD
     CHAR_DIR --> VLM_CAP
     VLM_CAP --> BUNDLE
     BUNDLE --> TIER_GEN
-    EXT_DOC --> TIER_GEN
     TIER_GEN --> DS_KG
     TIER_GEN --> VDB
     TIER_GEN --> KV
@@ -104,34 +111,45 @@ flowchart TD
 
 ```text
 MovieRag/
-├── Animated_AD/                      # Upstream + adapted CV/Audio character recognition modules
-├── MovieRAG/                         # Modified VideoRAG package (spoiler-aware indexing & agentic query)
+├── Animated_AD/                           # Upstream + adapted CV/Audio character recognition modules
+├── char_bank/{movie_id}/                  # Character reference images, glossary, windows & plot docs
+│   ├── raw_images/{Character}/            # Multi-state reference crops (from NB0 or manual frames)
+│   ├── character_glossary.json            # Visual-first + timeline-gated + negative-constraint glossary
+│   ├── appearance_windows.json            # Manual {char: [[start_s, end_s], ...]} timeline gates
+│   └── external_plot.txt                  # Phase-granular (MM:SS - MM:SS) grounding & Tier-3 synopsis
+├── MovieRAG/                              # Modified VideoRAG package (Phase B — Next Up)
 │   └── videorag/
-│       ├── base.py                   # Extended QueryParam (with chat_history) & 1-Scene=1-Chunk TextChunkSchema
-│       ├── videorag.py               # Added insert_knowledge_bundle() & VDB metadata fields
-│       ├── _llm.py                   # Added deepseek_config (with tool calling) & vision_subtool_func
-│       ├── _op.py                    # Time-sliced KG merge, Turn-0 GraphRAG context & 3-round Agent Loop
+│       ├── base.py                        # Extended QueryParam (with chat_history) & 1-Scene=1-Chunk TextChunkSchema
+│       ├── videorag.py                    # Added insert_knowledge_bundle() & VDB metadata fields
+│       ├── _llm.py                        # Added deepseek_config (with tool calling) & vision_subtool_func
+│       ├── _op.py                         # Time-sliced KG merge, Turn-0 GraphRAG context & 3-round Agent Loop
 │       └── _storage/
-│           └── vdb_nanovectordb.py   # Added filter_lambda support to NanoVectorDBStorage.query()
-├── api/                              # Lightweight Standalone Chatbot API Layer (CPU-only, zero GPU)
-│   └── app.py                        # FastAPI service (/api/v1/movie/info, /api/v1/chat)
-├── notebooks/                        # Environment-isolated Google Colab Pro notebooks for Phase A
-│   ├── PhaseA1_Visual_Pipeline.ipynb # Stages A1-A3 (PySceneDetect + OWLv2 + SAM 2.1 + DINOv2)
-│   └── PhaseA2_Audio_and_VLM.ipynb   # Stages A4-A5 (WhisperX + LWTNet + ECAPA-TDNN + Qwen2.5-VL-7B)
-├── pipeline/                         # Orchestration scripts for Phase A (Colab GPU) -> Handoff JSON
-│   ├── stage1_scenes.py              # Shot detection & 15-30s shot-aligned scene grouping
-│   ├── stage2_charbank.py            # Semi-automated char_bank folder + DINOv2 contrastive tuning
-│   ├── stage3_visual_recog.py        # Per-shot TGRP + DINOv2 ID + adaptive annotated shot-keyframe extraction
-│   ├── stage4_subtitles.py           # SDH parser / WhisperX + LWTNet AV-sync + ECAPA-TDNN attribution
-│   └── stage5_vlm_caption.py         # 2-Pass VLM captioner (Pass 1: rich caption, Pass 2: exit_state)
-├── workdir/                          # Per-movie isolated knowledge bases (synced via rclone)
+│           └── vdb_nanovectordb.py        # Added filter_lambda support to NanoVectorDBStorage.query()
+├── api/                                   # Standalone Chatbot API Layer (Phase C — Next Up)
+│   └── app.py                             # FastAPI service (/api/v1/movie/info, /api/v1/chat)
+├── notebooks/                             # 4 environment-isolated Google Colab notebooks for Phase A
+│   ├── PhaseA0_CharBank_Bootstrap.ipynb   # Stage A0 (T4 GPU): Credits preview & hybrid cluster char bank
+│   ├── PhaseA1_Visual_Pipeline.ipynb      # Stages A1-A3: PySceneDetect + OWLv2 + SAM 2.1 + DINOv2 + 2-6fps frames
+│   ├── PhaseA2_Audio_Pipeline.ipynb       # Stage A4: faster-whisper + LWTNet + ECAPA-TDNN + manual overrides
+│   └── PhaseA3_VLM_Captioning.ipynb       # Stage A5 (CPU): Micro-beat deepseek-flash API + deterministic merge
+├── pipeline/                              # Phase A orchestration modules (COMPLETED)
+│   ├── stage0_bootstrap_charbank.py       # Credits preview + OWLv2/DINOv2 clustering + charbank export
+│   ├── stage1_scenes.py                   # Shot detection, take lineage, 15-30s scenes & 4-10s micro-beats
+│   ├── stage2_charbank.py                 # Contrastive DINOv2 tuning + Farthest-Point 16/char bank
+│   ├── stage3_visual_recog.py             # Sharp-seed TGRP + seam carry-over + 1-seed rescue + 2-6fps keyframes
+│   ├── stage4_subtitles.py                # SDH/faster-whisper + LWTNet + ECAPA-TDNN + manual speaker fixes
+│   └── stage5_vlm_caption.py              # Micro-beat deepseek-flash captioner + telemetry + $0 scene merge
+├── workdir/                               # Per-movie isolated knowledge bases (synced via rclone)
 │   └── {movie_id}/
+│       ├── shots_and_scenes.json
+│       ├── vlm_beats.jsonl
+│       ├── vlm_captions.jsonl
 │       ├── movie_knowledge_bundle.json
-│       ├── keyframes/                # Adaptive per-shot keyframes (with character bboxes drawn)
+│       ├── keyframes/                     # Motion-adaptive 2-6 fps annotated keyframes
 │       ├── kv_store_video_segments.json
 │       ├── kv_store_text_chunks.json
 │       ├── vdb_chunks.json
 │       ├── vdb_entities.json
 │       └── graph_chunk_entity_relation.graphml
-└── Notes/                            # Architecture & design documentation
+└── Notes/                                 # Architecture & design documentation
 ```
