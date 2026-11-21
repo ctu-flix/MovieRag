@@ -1,5 +1,5 @@
 ---
-Date: 2026-11-18
+Date: 2026-11-21
 Top Level:
   - "[[_tech_]]"
 Topic:
@@ -30,10 +30,10 @@ Saved at `workdir/{movie_id}/movie_knowledge_bundle.json`. Once this file and `w
   "fps": 24.0,
   "character_glossary": {
     "Sintel": "Young woman protagonist. Visuals by timeline: in the Ishtar flashback (02:35 - 05:35), she is a teenager with short dark-brown hair...; in the mountain/desert quest (00:25 - 02:35 and 05:35 - 08:15), she wears a dark fur-lined travel cloak...; in the final volcanic cavern act (08:15 - 12:25), she has weathered shoulder-length hair with gray streaks and facial scars.",
-    "Scales": "Small, playful baby red dragon with large amber eyes, leathery red wings, and a long tail. In the Ishtar flashback (02:58 - 05:05), his injured left wing is wrapped in a pale cloth bandage by Sintel...",
-    "Adult Dragon": "Massive, fierce winged red dragon with horns, spiked spine, and large leathery wings...",
-    "Shaman": "Elderly, clean-shaven tribal healer with long white beaded dreadlocks... VISUAL CONSTRAINT: He has NO beard or mustache...",
-    "Gatekeeper": "Fierce, bald, unmasked tribal warrior with a dark mustache and goatee... VISUAL CONSTRAINT: He does NOT wear a mask."
+    "Scales": "Small, playful baby light-brown dragon with large amber eyes, leathery light-brown wings, and a long tail. In the Ishtar flashback (02:58 - 05:05), his injured left wing is wrapped in a pale cloth bandage by Sintel. In the volcanic cavern (09:10 - 12:25), a separate, unbandaged fledgling baby light-brown dragon appears—this is a different baby dragon (Scales's own offspring), though Sintel initially mistakes it for young Scales.",
+    "Adult Dragon": "Massive, fierce winged dark-brown dragon with horns, spiked spine, and large leathery wings. Over Ishtar (05:00 - 05:30), a giant wild adult dragon swoops down from the clouds and snatches baby Scales away. Inside the volcanic cavern (09:15 - 11:15), a different giant adult dragon lairs beside a fledgling baby dragon and battles Sintel. In the finale (11:15 - 12:35), a healed notch and bandage-scar on this cavern adult dragon's wing reveals it is actually grown-up Scales decades later.",
+    "Shaman": "Elderly wearing a dark textured cap/headdress adorned with small curved horn ornaments, white ceremonial face paint across his eyes and nose, patterned robes, and a short weathered greyish-green beard, who shelters and questions Sintel inside a warmly lit desert hut.",
+    "Gatekeeper": "Fierce, bald, unmasked tribal warrior with a dark mustache and goatee, wearing heavy robes and tall wooden banner poles strapped to his back (which create a spiky silhouette in the mountain mist), wielding a curved metallic spear-blade with a circular hilt ring (00:35 - 01:26)."
   },
   "external_plot_documents": [
     {
@@ -227,7 +227,7 @@ In `MovieRAG/videorag/_op.py`, nodes and edges store a JSON-encoded `temporal_de
 | Attribute Key | Type | Example Value | Purpose |
 | :--- | :--- | :--- | :--- |
 | `entity_type` | `str` | `"CHARACTER"` | Standard entity classification |
-| `first_seen_time` | `float` | `45.0` | Earliest `start_time` of any chunk mentioning this entity. If `first_seen_time > T_user` when `spoiler_free=True`, the entity is completely hidden. |
+| `first_seen_time` | `float` | `45.0` | Earliest `start_time` among `tier == "scene"` slices mentioning this entity (falls back to all slices only if no scene slice exists, preventing `00:00` chapter timestamps from leaking late-appearing entities). If `first_seen_time > T_user` when `spoiler_free=True`, the entity is completely hidden. |
 | `temporal_descriptions` | `str` (JSON list) | `[{"chunk_id": "chunk-1", "start_time": 45.0, "end_time": 72.0, "tier": "scene", "description": "..."}]` | Filtered at query time so only facts with `start_time <= T_user` (and `tier != "full_movie"`) are assembled into the entity description. |
 | `description` | `str` | `"Scales is a baby dragon rescued by Sintel..."` | Full-movie merged summary (used when `spoiler_free=False`). |
 | `source_id` | `str` | `"chunk-1<SEP>chunk-9"` | Pointers back to `text_chunks`. |

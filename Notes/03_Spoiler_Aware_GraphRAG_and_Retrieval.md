@@ -1,5 +1,5 @@
 ---
-Date: 2026-11-11
+Date: 2026-11-21
 Top Level:
   - "[[_tech_]]"
 Topic:
@@ -51,12 +51,12 @@ flowchart TD
    - We do **not** pack multiple scenes into an 800-token window; `chunk_token_size` is raised to `2048` tokens so every scene retains its full shot-by-shot visual and dialogue fidelity with exact `start_time` and `end_time`.
    - External plot documents are **never** injected into Tier 1 or Tier 2 generation so early chunks cannot accidentally foreshadow late-movie twists.
 2. **Tier 2 (`chapter`)**:
-   - Every ~5–10 minutes of movie time (e.g., `chapter_window_sec = 300.0`), DeepSeek API (`deepseek-chat`) summarizes the constituent Tier 1 scene descriptions + dialogues into a cohesive 1–2 paragraph chapter narrative.
+   - Every ~5 minutes of movie time (`chapter_window_sec = 300.0`), DeepSeek API (`deepseek-flash`, `thinking: disabled`) summarizes the constituent Tier 1 scene descriptions + dialogues into a cohesive 1–2 paragraph chapter narrative.
    - Stamped with `tier = "chapter"`, `start_time = chapter_start`, `end_time = chapter_end`.
    - When a user is at `T_user = 450s` (`00:07:30`) with `spoiler_free = True`, Chapter 1 (`end_time = 300.0 <= 450.0`) is unlocked to give the LLM macro story context up to that point.
-3. **Tier 3 (`full_movie`)**:
-   - Ingests `external_plot_documents` (Wikipedia/Fandom plot summaries, thematic analyses, character arcs) plus a synthesized overview across all chapters.
-   - Stamped with `tier = "full_movie"`, `start_time = 0.0`, `end_time = movie_duration` (strictly locked when `spoiler_free = True`).
+3. **Tier 3 (`full_movie`) & Turn-0 Authoritative Plot Timeline**:
+   - Ingests `external_plot_documents` (time-aligned `(MM:SS - MM:SS)` sub-beat grounding references, plot summaries, character arcs) into Tier 3 (`start_time = 0.0`, `end_time = movie_duration`, unlocked in `chunks_vdb` only when `spoiler_free = False`).
+   - **In addition**, at Turn 0, `_extract_unlocked_external_plot_blocks()` parses timestamped `(MM:SS - MM:SS)` sub-beat blocks directly from `external_plot_documents` and injects only **completed** blocks (`end_sec <= T_user` when `spoiler_free = True`, or all blocks when `spoiler_free = False`) into `<authoritative_plot_timeline_up_to_T_user>`. The system prompt designates this block as the **primary Source of Truth** whenever automated scene captions conflict with the plot.
 
 ---
 
@@ -79,7 +79,7 @@ In `MovieRAG/videorag/_op.py`, `_merge_nodes_then_upsert()` and `_merge_edges_th
          "description": entity_description,
      }
      ```
-   - In `_merge_nodes_then_upsert()` and `_merge_edges_then_upsert()`, we append these dicts to `temporal_descriptions` (sorted by `start_time`) and compute `first_seen_time = min(d["start_time"] for d in temporal_descriptions)`.
+   - In `_merge_nodes_then_upsert()` and `_merge_edges_then_upsert()`, we append these dicts to `temporal_descriptions` (sorted by `start_time`) and compute `first_seen_time` from `tier == "scene"` slices first (falling back to all slices only if no scene slice exists, preventing `00:00` chapter chunks from leaking late-appearing entities). Entity names are normalized by stripping surrounding quotes and leading articles (`"THE "`, `"A "`, `"AN "`).
    - In `entities_vdb`, we upsert **one rich vector record per temporal slice** (`f"{entity_name}: {d['description']}"` with metadata `start_time`, `end_time`, `tier`) so vector search gets full descriptive recall while filtering out slices with `start_time > T_user`!
 
 2. **During Retrieval (`_find_most_related_segments_from_entities` + Graph Context Builder)**:
@@ -88,7 +88,8 @@ In `MovieRAG/videorag/_op.py`, `_merge_nodes_then_upsert()` and `_merge_edges_th
      2. **Hide Unintroduced Entities**: Discard any graph node where `node["first_seen_time"] > T_user`.
      3. **Reconstruct Spoiler-Safe Node & Edge Histories**: Filter each matched node and 1-hop edge's `temporal_descriptions` to keep only events where:
         $$\text{tier} \neq \text{"full\_movie"} \quad \land \quad \text{start\_time} \le T_{\text{user}}$$
-     4. **Rank 1-Hop Co-Occurring Scene Chunks**: Run `_find_most_related_segments_from_entities()` restricted to source chunks with `start_time <= T_user` and `tier != "full_movie"`.
+        Also strip future-dated timeline sentences/clauses from each entity's `[Glossary]` entry via `filter_glossary_text_for_timestamp()`. At Turn 0, keep the 1st + 5 most recent entity slices (full timeline available via `get_character_history`), and sort 1-hop relations by `(both_in_kept, weight, most_recent_end)`.
+     4. **Rank 1-Hop Co-Occurring Scene Chunks**: Run `_find_most_related_segments_from_entities()` restricted to `tier == "scene"` chunks with `start_time <= T_user`.
      5. **Inject Both**: Unlike vanilla `VideoRAG`, we inject **both** the Graph-Ranked Scene Chunks **and** the reconstructed **Graph Entity & Relationship Histories** into the Turn-0 prompt!
 
 ---
@@ -102,7 +103,9 @@ When a user pauses at $T_{\text{user}} = \text{00:08:45}$ (`525.0s`):
   - **For `tier == "scene"`**: Allow any scene where `start_time <= T_user`.
   - **For `tier == "chapter"`**: Require `end_time <= T_user` (a chapter summary is only safe once the viewer has completed that chapter).
   - **For `tier == "full_movie"`**: Require `spoiler_free == False`.
-  - **Subtitle Clipping on Straddling Scenes**: Whenever a scene has `start_time <= T_user < end_time` and `spoiler_free == True`, dynamically format its `[Subtitles / Dialogue]` block by filtering `subtitles` to `utt["start_time"] <= T_user`. Any line spoken after `T_user` is stripped before reaching the LLM.
+  - **Micro-Beat & Subtitle Clipping on Straddling Scenes**: Whenever a scene has `start_time <= T_user < end_time` and `spoiler_free == True`, `format_scene_segment_for_timestamp()` dynamically clips **both**:
+    - `[Visual Description]`: Strips any `[MM:SS.ss - MM:SS.ss]` micro-beat paragraph whose `beat_start > T_user` (`_clip_vlm_caption_at_timestamp`).
+    - `[Subtitles / Dialogue]`: Filters `subtitles` to `utt["start_time"] <= T_user`, stripping any line spoken after `T_user`.
 
 ---
 
@@ -111,29 +114,29 @@ When a user pauses at $T_{\text{user}} = \text{00:08:45}$ (`525.0s`):
 ### Why Hybrid Turn-0 + Agentic Tools Is Best
 In vanilla `VideoRAG` ([`MovieRAG/videorag/_op.py:694-858`](file:///home/tris/TRIS_WORKS/ctu-flix/MovieRag/MovieRAG/videorag/_op.py#L694-L858)), retrieval was a rigid single-pass pipeline that ran LLM Yes/No filters on every segment and loaded local `MiniCPM-V` at query time to re-caption raw video frames for every query.
 
-Our upgraded architecture combines **Turn-0 Spoiler-Filtered GraphRAG Pre-Retrieval** (giving the LLM all the context of the original pipeline immediately at Turn 0) with **Bounded Agentic Tool-Calling (`DeepSeek-V3`, Max 3 Rounds)** so the LLM can decide if Turn 0 is already enough or if it needs to fetch more scenes, character histories, or inspect visual keyframes!
+Our upgraded architecture combines **Turn-0 Spoiler-Filtered GraphRAG Pre-Retrieval** (giving the LLM all the context of the original pipeline immediately at Turn 0) with **Bounded Agentic Tool-Calling (`deepseek-flash` with `thinking: enabled`, Max 3 Rounds)** so the LLM can decide if Turn 0 is already enough or if it needs to fetch more scenes, character histories, or inspect visual keyframes!
 
 ```mermaid
 flowchart TD
-    Q["User Query + T_user + spoiler_free"] --> TURN0["Turn 0: Automatic Spoiler-Filtered GraphRAG Pre-Retrieval"]
+    Q["User Query + T_user + spoiler_free"] --> TURN0["Turn 0: Automatic Spoiler-Filtered GraphRAG Pre-Retrieval<br/>(Coref Resolution + Non-English -> English Translation)"]
 
-    subgraph PreRetrieval["Turn-0 Injected Context (Built Before Agent Loop Starts)"]
-        C_NOW["1. Active Scene at T_user (start_time <= T_user <= end_time)<br/>+ Unlocked Chapter Table of Contents + Character Glossary"]
-        C_VEC["2. Direct Vector Search (chunks_vdb)<br/>Top-K Scene & Chapter Chunks (<= T_user)"]
+    subgraph PreRetrieval["Turn-0 Injected Context (6 XML Blocks Built Before Agent Loop Starts)"]
+        C_NOW["1. Viewer State + Authoritative Plot Timeline (end_sec <= T_user)<br/>+ Previous Scene + Active Scene at T_user (micro-beat & subtitle clipped)"]
+        C_VEC["2. Direct Vector Search (chunks_vdb)<br/>Top-K Scene & Chapter Chunks (<= T_user, deduplicated)"]
         C_KG["3. Entity Query Rewrite -> entities_vdb -> 1-Hop Graph Walk<br/>Top Graph-Ranked Scenes + Temporal Entity & Edge Histories (<= T_user)"]
     end
 
     TURN0 --> C_NOW & C_VEC & C_KG
-    C_NOW & C_VEC & C_KG --> AGENT["DeepSeek-V3 Controller Agent<br/>'Is Turn-0 context sufficient to answer accurately?'"]
+    C_NOW & C_VEC & C_KG --> AGENT["deepseek-flash Controller Agent (thinking: enabled)<br/>'Is Turn-0 context sufficient to answer accurately?'"]
 
-    AGENT -- "Yes (~80% of queries: 0 tool calls!)" --> ANS["Synthesize Final Grounded Answer<br/>with [MM:SS - MM:SS] Citations"]
+    AGENT -- "Yes (~80% of queries: 0 tool calls!)" --> ANS["Synthesize Final Grounded Answer (in User's Language)<br/>with [MM:SS - MM:SS] Citations"]
     AGENT -- "Need deeper context / visual check (Rounds 1..3)" --> TOOLS["Parallel Tool Calls (Hard-Gated by T_user & spoiler_free)"]
 
     subgraph AgentTools["Spoiler-Gated Retrieval & Vision Tools"]
         T1["search_scenes(query, start_time, end_time)<br/>Semantic search over Tier-1/Tier-2 chunks <= T_user"]
         T2["get_character_history(character_name)<br/>Full temporal node & 1-hop edge timeline <= T_user"]
         T3["get_adjacent_scenes(scene_id, before=2, after=1)<br/>Walks backward/forward along scene timeline <= T_user"]
-        T4["inspect_keyframes(scene_id, visual_question)<br/>Option A Vision Sub-Tool: Queries Vision API on shot-keyframes<br/>of scene_id (<= T_user) & returns text observation to DeepSeek"]
+        T4["inspect_keyframes(scene_id, visual_question, target_timestamp)<br/>Option A Vision Sub-Tool: Queries deepseek-flash VLM on up to 4<br/>keyframes (<= T_user) & returns text observation"]
     end
 
     TOOLS --> T1 & T2 & T3 & T4
@@ -142,41 +145,49 @@ flowchart TD
 
 ### Side-by-Side Comparison: Original `VideoRAG` Context vs. New Turn-0 Context
 
-| Context Block | Original `VideoRAG` (`_op.py:849`) | New **Turn-0 Injected Context** |
+| Context Block | Original `VideoRAG` (`_op.py:849`) | New **Turn-0 Injected Context (6 XML Blocks)** |
 | :--- | :--- | :--- |
-| **1. Viewer State & Active Scene at `T_user`** | ❌ None | ✅ Injects `T_user`, `spoiler_free` status, unlocked Chapter Table of Contents, and the full **Active Scene Chunk at `T_user`** (with subtitles clipped at `<= T_user`). |
-| **2. Direct Vector Chunks (`chunk_data`)** | ✅ Top-K chunks from `chunks_vdb` (unfiltered). | ✅ Top-K Tier-1 `scene` & Tier-2 `chapter` chunks from `chunks_vdb` (strictly filtered by `T_user` & `spoiler_free`). |
-| **3. Graph-Retrieved Knowledge** | ⚠️ Uses LLM entity rewrite + `entities_vdb` + 1-hop graph `relation_counts` only to find `video_segment_id`s; **discards** graph node/edge descriptions; runs live MiniCPM-V on raw video to build `video_data` CSV. | ✅ Runs LLM entity rewrite + time-sliced `entities_vdb` + 1-hop graph `relation_counts` and injects **both**:<br>• The **Top Graph-Ranked Scene Chunks** (deduplicated against Vector Chunks), and<br>• The **Temporal Entity & Relationship Descriptions** (`start_time <= T_user`) from the Knowledge Graph. |
-| **4. Visual Keyframe Inspection** | Forced local MiniCPM-V re-captioning on every remaining segment on every query. | ⚡ **On-Demand via `inspect_keyframes(scene_id, visual_question)` (Option A)**: `DeepSeek-V3` calls this tool only when the user asks a fine-grained visual question or when a scene caption lacks a needed visual detail. |
+| **1. Viewer State, Authoritative Plot & Scene Continuity** | ❌ None | ✅ Injects `<viewer_state>` (`T_user`, `spoiler_free`, unlocked Chapters), `<authoritative_plot_timeline_up_to_T_user>` (completed external plot sub-beats `end_sec <= T_user`), `<previous_scene_before_T_user>`, and `<current_scene_at_T_user>` (micro-beats & subtitles clipped at `<= T_user`). |
+| **2. Direct Vector Chunks (`chunk_data`)** | ✅ Top-K chunks from `chunks_vdb` (unfiltered). | ✅ Top-K Tier-1 `scene` & Tier-2 `chapter` chunks from `chunks_vdb` (strictly filtered by `T_user` & `spoiler_free`, deduplicated against `prev_scene` and `active_scene`). |
+| **3. Graph-Retrieved Knowledge** | ⚠️ Uses LLM entity rewrite + `entities_vdb` + 1-hop graph `relation_counts` only to find `video_segment_id`s; **discards** graph node/edge descriptions; runs live MiniCPM-V on raw video to build `video_data` CSV. | ✅ Runs LLM entity rewrite + time-sliced `entities_vdb` + 1-hop graph `relation_counts` (`tier == "scene"` only) and injects **both**:<br>• The **Top Graph-Ranked Scene Chunks** (deduplicated against Vector/Prev/Active scenes), and<br>• The **Temporal Entity & Relationship Descriptions** (`start_time <= T_user`, glossary filtered by timestamp, 1st + 5 most recent entity slices, edges prioritized by `(both_in_kept, weight, recency)`). |
+| **4. Visual Keyframe Inspection** | Forced local MiniCPM-V re-captioning on every remaining segment on every query. | ⚡ **On-Demand via `inspect_keyframes(scene_id, visual_question, target_timestamp)` (Option A)**: `deepseek-flash` calls this tool only when the user asks a fine-grained visual question or when a scene caption lacks a needed visual detail. |
 
-### Concrete Turn-0 Prompt Layout Sent to `DeepSeek-V3`
+### Concrete Turn-0 Prompt Layout Sent to `deepseek-flash`
 ```xml
 <viewer_state>
-  Movie: Sintel | Current Watch Timestamp (T_user): 00:08:45 (525.0s) | Spoiler-Free Mode: ON
+  Movie: Sintel | Current Watch Timestamp (T_user): 01:50 (110.0s) | Spoiler-Free Mode: ON
   Unlocked Chapters up to T_user:
-  - Chapter 1 [00:00:00 - 00:05:00]: Sintel's Mountain Journey & Finding Scales
+  - (No completed chapters unlocked yet at this timestamp)
 </viewer_state>
 
+<authoritative_plot_timeline_up_to_T_user>
+Prologue.A — Black Screen & Opening Credits Over Empty Snowy Mountains (00:00 - 00:25): ...
+Act I.A3 — Fatal Counter-Strike, Claiming the Spear-Blade, and Snowstorm Collapse (01:05 - 01:41): ...
+</authoritative_plot_timeline_up_to_T_user>
+
+<previous_scene_before_T_user>
+[SCENE sintel_scene_0003 | 01:14.08 - 01:41.25 | Characters: Sintel] ...
+</previous_scene_before_T_user>
+
 <current_scene_at_T_user>
-  [SCENE sintel_scene_0012 | 00:08:12 - 00:08:55 | Characters: Sintel, Scales]
-  [Visual Description]:
-  Across 4 shots, Sintel sprints up the snowy ridge clutching her staff while Scales circles overhead...
-  [Subtitles / Dialogue (clipped at 00:08:45)]:
-  - [00:08:15 - 00:08:18] Sintel: "Scales, stay back!"
+[SCENE sintel_scene_0004 | 01:41.25 - 02:11.04 | Characters: Shaman, Sintel]
+[Visual Description]:
+[01:41.25 - 01:49.38] Inside the warm, dimly lit interior of the Shaman's hut...
+[Subtitles / Dialogue (clipped at 01:50)]:
+- [01:47.25 - 01:49.22] Shaman: "This blade has a dark past."
 </current_scene_at_T_user>
 
 <graph_entities_and_relations_up_to_T_user>
-  Entity [SINTEL] (first seen 00:00:12):
-    - [Glossary]: Young woman searching for her pet dragon Scales; wears a brown cloak and carries a staff.
-    - [00:02:10 - 00:03:05]: Found injured baby dragon Scales in the snow and bandaged his wing.
-  Relation [SINTEL <-> SCALES]:
-    - [00:02:10 - 00:08:00]: Sintel nurses Scales back to health; Scales flies beside her on her journey.
+  Entity [SINTEL] (first seen 00:18):
+    - [Glossary]: Young woman protagonist. Visuals by timeline: in the mountain/desert quest (00:25 - 02:35)...
+    - [00:18 - 00:47]: ...
+  Relation [SHAMAN <-> SINTEL]:
+    - [01:41 - 02:11]: ...
 </graph_entities_and_relations_up_to_T_user>
 
 <retrieved_scene_and_chapter_chunks_up_to_T_user>
-  <!-- Union of Direct Vector Search (chunks_vdb) + 1-Hop Graph Co-Occurrence Search -->
-  [SCENE sintel_scene_0005 | 00:02:10 - 00:03:05 | Source: Graph+Vector]: ...
-  [CHAPTER sintel_chap_0001 | 00:00:00 - 00:05:00 | Source: Vector]: ...
+  <!-- Union of Direct Vector Search (chunks_vdb) + 1-Hop Graph Co-Occurrence Search (deduplicated) -->
+  [SCENE sintel_scene_0001 | 00:17.96 - 00:47.38 | Source: Graph+Vector]: ...
 </retrieved_scene_and_chapter_chunks_up_to_T_user>
 ```
 
@@ -184,39 +195,40 @@ flowchart TD
 
 ## 5. Specification of the 4 Spoiler-Gated Agent Tools (Max 3 Rounds)
 
-All 4 tools are bound via OpenAI-compatible `tools` schema on `deepseek-chat`. **Crucially, `T_user` and `spoiler_free` are bound inside the Python tool closures on the server side**, so the LLM can never bypass the spoiler cutoff even if it requests a future timestamp:
+All 4 tools are bound via OpenAI-compatible `tools` schema on `deepseek-flash` (with `thinking: enabled` and `reasoning_content` preserved across multi-round tool calls within a turn; configurable via `DEEPSEEK_CHAT_THINKING`). **Crucially, `T_user` and `spoiler_free` are bound inside the Python tool closures on the server side**, so the LLM can never bypass the spoiler cutoff even if it requests a future timestamp:
 
 1. **`search_scenes(query: str, start_time: float = 0.0, end_time: float = None) -> str`**:
    - Clamps `effective_end = min(end_time or T_user, T_user)` when `spoiler_free = True`.
-   - Queries `chunks_vdb` with `filter_lambda` (`start_time >= start_time` and straddle-safe `<= effective_end`) and returns up to 5 formatted scene/chapter chunks (with subtitles clipped at `T_user`).
+   - Queries `chunks_vdb` with `filter_lambda` (`start_time >= start_time` and straddle-safe `<= effective_end`) and returns up to 5 formatted scene/chapter chunks (with micro-beats and subtitles clipped at `T_user`).
 2. **`get_character_history(character_name: str) -> str`**:
    - Fuzzy-matches `character_name` against the Knowledge Graph nodes and `entities_vdb` ($\le T_{\text{user}}$).
-   - Returns the character's glossary entry, chronological `temporal_descriptions` ($\le T_{\text{user}}$), and all 1-hop relationship edges (`temporal_descriptions` $\le T_{\text{user}}$) with the scene IDs where each interaction occurred.
+   - Returns the timestamp-filtered glossary entry, complete chronological `temporal_descriptions` ($\le T_{\text{user}}$), and all 1-hop relationship edges (`temporal_descriptions` $\le T_{\text{user}}$).
 3. **`get_adjacent_scenes(scene_id: str, before: int = 2, after: int = 1) -> str`**:
    - Fetches the scenes immediately preceding and succeeding `scene_id` from `kv_store_video_segments.json`.
-   - When `spoiler_free = True`, any succeeding scene with `start_time > T_user` is blocked, and any straddling scene has its subtitles clipped at `T_user`.
-4. **`inspect_keyframes(scene_id: str, visual_question: str) -> str` (Option A: Vision Sub-Tool)**:
+   - When `spoiler_free = True`, any succeeding scene with `start_time > T_user` is blocked, and any straddling scene has its micro-beats and subtitles clipped at `T_user`.
+4. **`inspect_keyframes(scene_id: str, visual_question: str, target_timestamp: Optional[float] = None) -> str` (Option A: Vision Sub-Tool)**:
    - Looks up the pre-extracted, bbox-annotated shot-keyframes for `scene_id` in `kv_store_video_segments.json`, keeping only keyframes with `timestamp <= T_user` when `spoiler_free = True`.
-   - Sends up to 4 sharp shot-keyframes + the character color legend + `visual_question` to the configured **Vision API** (`Qwen2.5-VL-72B-Instruct`, `gemini-2.5-flash`, or `gpt-4o-mini`).
-   - Returns the Vision API's detailed visual observation as a tool response string back to `DeepSeek-V3`.
+   - Selects up to 4 sharp shot-keyframes: either the **4 closest to `target_timestamp`** (clamped `<= T_user` when `spoiler_free = True`) or 4 evenly spaced across the scene, downscales to `960px` width, and queries **`deepseek-flash`** (`thinking: disabled`, overridable via `VISION_MODEL_ID`) with the character color legend and timestamp-filtered glossary.
+   - Returns the Vision API's detailed visual observation as a tool response string back to the orchestrator agent.
 
 ### Iteration Budget & Termination
 - **Max Rounds**: `max_tool_rounds = 3` (parallel tool calls allowed within each round).
-- If the agent reaches Round 3 and still attempts a tool call, we strip `tools` from the final API call and instruct `DeepSeek-V3` to synthesize the best possible grounded answer from all context gathered across Turns 0–3.
+- If the agent reaches Round 3 and still attempts a tool call, we strip `tools` from the final API call and instruct `deepseek-flash` to synthesize the best possible grounded answer from all context gathered across Turns 0–3.
 
 ---
 
-## 6. Multi-Turn Conversation Memory (`chat_history`)
+## 6. Multi-Turn Conversation Memory (`chat_history`) & Multilingual Support
 
-To support natural follow-up questions during a watch session (e.g., Turn 1: *"Who is the old man in the tent?"* $\rightarrow$ Turn 2: *"Why did he ask her that?"* or *"Where did she get that staff?"*) while allowing the user to scrub the video timeline (`T_user`) or toggle `spoiler_free` between turns:
+To support natural follow-up questions in any language during a watch session (e.g., Turn 1: *"Who is the old man in the tent?"* $\rightarrow$ Turn 2: *"Why did he ask her that?"*) while allowing the user to scrub the video timeline (`T_user`) or toggle `spoiler_free` between turns:
 
 1. **Stateless `chat_history` Parameter in `QueryParam` (`MovieRAG/videorag/base.py`)**:
-   - Add `chat_history: list[dict[str, str]] = field(default_factory=list)` to `QueryParam`.
-   - Format: Standard OpenAI message dicts `[{"role": "user" | "assistant", "content": "..."}]`, capped at the **last 6 messages (3 turns)**.
-2. **Coreference Resolution in Turn-0 Query Rewriting (`MovieRAG/videorag/_op.py`)**:
-   - Pass `query_param.chat_history` into `_refine_entity_retrieval_query()` and Turn-0 vector search query rewriting so pronouns and deictic references (*"he"*, *"that"*, *"it"*, *"there"*) resolve against the preceding 1–3 turns before querying `chunks_vdb` and `entities_vdb`.
-3. **Message Array Construction for `DeepSeek-V3`**:
-   - Construct the `messages` array sent to `deepseek-chat` as:
+   - `chat_history: list[dict[str, str]] = field(default_factory=list)`, standard OpenAI message dicts capped at the **last 6 messages (3 turns)**.
+2. **Coreference Resolution & Non-English Translation in Step 0.1 (`_resolve_query_with_chat_history`)**:
+   - Triggered whenever `chat_history` is non-empty **or** the raw query contains non-ASCII characters (skipped for standalone Turn-1 English queries to save latency).
+   - Resolves pronouns/deictic references against `chat_history[-6:]` **and** translates non-English queries into standalone English for querying the English `BAAI/bge-base-en-v1.5` vector & graph index.
+3. **Language-Neutral Response Rule & Message Array Construction**:
+   - The system prompt enforces: *"Always write your final response in the exact same language as the user's latest message; never switch languages"* (deliberately language-neutral with no named non-English example to prevent language-priming drift) while passing English arguments to retrieval tools.
+   - Construct the `messages` array sent to `deepseek-flash` as:
      ```python
      messages = [
          {"role": "system", "content": system_prompt_with_fresh_turn0_context},
@@ -226,7 +238,7 @@ To support natural follow-up questions during a watch session (e.g., Turn 1: *"W
      ```
 4. **Fresh Turn-0 Context on Every Request (Slider-Safe Rule)**:
    - **Never** persist previous turns' raw Turn-0 context blocks inside `chat_history`.
-   - Re-compute the Turn-0 context block fresh on every request using the current request's `T_user` and `spoiler_free` parameters. This guarantees that if the user scrubs the video player forward (or backward) mid-conversation, the active scene and spoiler boundary immediately reflect the new `T_user` without stale context bloat.
+   - Re-compute the Turn-0 context block fresh on every request using the current request's `T_user` and `spoiler_free` parameters.
 
 ---
 
@@ -234,7 +246,7 @@ To support natural follow-up questions during a watch session (e.g., Turn 1: *"W
 
 | Component | `spoiler_free = True` (at `T_user`) | `spoiler_free = False` (at `T_user` or `None`) |
 | :--- | :--- | :--- |
-| **Turn-0 Active Scene** | Scene covering `T_user`, with `[Subtitles / Dialogue]` clipped at `<= T_user` | Scene covering `T_user` (if `T_user` given) without subtitle clipping |
+| **Turn-0 Authoritative Plot & Scenes** | Completed `(MM:SS - MM:SS)` external plot blocks (`end_sec <= T_user`) + Previous Scene + Active Scene (micro-beats & subtitles clipped at `<= T_user`) | All external plot blocks + Previous Scene + Active Scene (if `T_user` given) without clipping |
 | **Tier 1 (`scene` chunks)** | Filtered: `start_time <= T_user` (straddling scenes have subtitles clipped `<= T_user`) | Unrestricted (`0.0` to `movie_duration`) |
 | **Tier 2 (`chapter` chunks)** | Filtered: `end_time <= T_user` | Unrestricted (`0.0` to `movie_duration`) |
 | **Tier 3 (`full_movie` plot)** | **Blocked** | **Enabled** (full plot twists, ending analysis, themes) |
