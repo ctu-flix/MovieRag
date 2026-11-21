@@ -1,0 +1,13 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.6.0
+httpx>=0.27.0
+openai>=1.50.0
+tenacity>=8.2.0
+tiktoken>=0.7.0
+networkx>=3.2
+numpy>=1.24.0
+nano-vectordb>=0.0.4.3
+sentence-transformers>=2.7.0
+Pillow>=10.0.0
+pytest>=8.0.0

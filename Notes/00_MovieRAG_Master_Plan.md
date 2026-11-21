@@ -75,7 +75,7 @@ flowchart TD
     end
 
     subgraph StageC["4. Phase C: Standalone FastAPI Service + Hybrid Turn-0 GraphRAG & Agentic Loop"]
-        API["FastAPI Chatbot Layer (api/app.py)<br/>GET /api/v1/movie/info | POST /api/v1/chat<br/>Stateless chat_history (last 6 msgs / 3 turns)"]
+        API["FastAPI Chatbot Layer (api/app.py)<br/>GET /health | POST /api/v1/chat<br/>Stateless chat_history (last 6 msgs / 3 turns)"]
         TURN0["Turn 0 Pre-Retrieval (Spoiler-Filtered <= T_user)<br/>Coref/Translate Query + Unlocked External Plot + Prev & Active Scene + Vector Chunks + 1-Hop Graph"]
         AGENT["deepseek-flash Orchestrator Agent (thinking: enabled)<br/>Answers at Turn 0 or Calls Tools (Max 3 Rounds)"]
         TOOLS["Spoiler-Gated Tools:<br/>search_scenes | get_character_history | get_adjacent_scenes | inspect_keyframes (deepseek-flash VLM)"]

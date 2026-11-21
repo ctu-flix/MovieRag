@@ -52,14 +52,15 @@ Topic:
   - **Bounded 3-Round Agentic Tool Loop**: Spoiler-gated `search_scenes`, `get_character_history`, `get_adjacent_scenes`, and `inspect_keyframes` (with optional `target_timestamp`).
 - **Verification**: Passed both mock-Sintel unit suite and full real Colab `PhaseB2_GraphRAG_Retrieval_Test.ipynb` benchmark (`02:00` / `05:40` spoiler-free vs. `spoiler_free=False`, `inspect_keyframes` with `target_timestamp=105.0`, and 3-turn timeline-scrubbing chat).
 
-### Step 1.5: Standalone FastAPI Chatbot Service Layer (`api/app.py`) — **[NEXT UP — PHASE C]**
-- Create `api/app.py` for the single-movie interactive demo:
-  - **Lifespan Startup**: Load the pre-indexed `VideoRAG` instance from `workdir/{movie_id}/` once into memory (CPU-only, zero GPU required).
+### Step 1.5: Standalone FastAPI Chatbot Service Layer (`api/app.py`) — **[COMPLETED & VERIFIED — PHASE C]**
+- Created `api/app.py` (`GET /health`, `POST /api/v1/chat`), `api/requirements.txt`, and `tests/test_api_phase_c.py` for the single-movie interactive service:
+  - **Lifespan Startup**: Loads the pre-indexed `VideoRAG` instance from `workdir/{movie_id}/` once into memory (CPU-only, zero GPU required), with graceful degraded startup and lazy reload when index files are not yet synced.
+  - **Concurrency Isolation**: Added `VideoRAG.aquery_with_trace()` using a per-request copy of `addon_params` so concurrent `/api/v1/chat` requests cannot overwrite each other's `tool_calls_trace`.
   - **Endpoints**:
-    - `GET /api/v1/movie/info`: Returns `movie_id`, `movie_title`, `duration_sec`, `character_glossary`, and chapter boundaries from `movie_knowledge_bundle.json`.
+    - `GET /health`: Reports readiness, `movie_id`, `movie_title`, `api_key_configured`, `missing_files`, and 3-tier/graph `index_counts`.
     - `POST /api/v1/chat`:
-      - Request JSON: `{ "query": str, "current_timestamp": float | str, "spoiler_free": bool = True, "chat_history": list[dict] = [] }`
-      - Response JSON: `{ "answer": str, "citations": list[str], "tool_calls_trace": list[dict], "effective_timestamp": float, "spoiler_free": bool }`
+      - Request JSON: `{ "query": str, "current_timestamp": float | str | None = None, "spoiler_free": bool = True, "chat_history": list[dict] = [], "max_tool_rounds": int = 3 }`
+      - Response JSON: `{ "answer": str, "tool_calls_trace": list[dict], "effective_timestamp": float | None, "spoiler_free": bool }`
 
 ---
 

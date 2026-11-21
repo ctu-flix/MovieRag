@@ -596,9 +596,12 @@ class VideoRAG:
         loop = always_get_an_event_loop()
         return loop.run_until_complete(self.aquery(query, param))
 
-    async def aquery(self, query: str, param: QueryParam = QueryParam()):
+    async def aquery_with_trace(
+        self, query: str, param: QueryParam = QueryParam()
+    ) -> Tuple[Any, List[Dict[str, Any]]]:
         cfg = asdict(self)
-        cfg["addon_params"] = self.addon_params
+        request_addon = dict(self.addon_params)
+        cfg["addon_params"] = request_addon
         if param.mode in ("videorag", "local", "global", "naive"):
             response = await videorag_query(
                 query,
@@ -631,7 +634,13 @@ class VideoRAG:
             )
         else:
             raise ValueError(f"Unknown mode {param.mode}")
+        trace = list(request_addon.get("last_tool_calls_trace") or [])
+        self.addon_params["last_tool_calls_trace"] = trace
         await self._query_done()
+        return response, trace
+
+    async def aquery(self, query: str, param: QueryParam = QueryParam()):
+        response, _ = await self.aquery_with_trace(query, param)
         return response
 
     async def ainsert(self, new_video_segment):
