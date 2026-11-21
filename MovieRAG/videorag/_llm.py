@@ -625,6 +625,9 @@ async def openai_chat_with_tools(
     """
     resolved_model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
     is_flash_model = "flash" in str(resolved_model).lower()
+    thinking_env = os.environ.get("DEEPSEEK_CHAT_THINKING", "enabled").strip().lower()
+    thinking_type = "disabled" if thinking_env in ("0", "false", "off", "disabled") else "enabled"
+    effective_max_tokens = max(max_tokens, 4096) if (is_flash_model and thinking_type == "enabled") else max_tokens
     resolved_key = api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY") or "sk-*******"
     client = get_deepseek_async_client_instance(api_key=resolved_key, base_url=base_url)
 
@@ -633,7 +636,7 @@ async def openai_chat_with_tools(
             "model": resolved_model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            "max_tokens": effective_max_tokens,
         }
         if tools:
             req_kwargs["tools"] = tools
@@ -643,7 +646,7 @@ async def openai_chat_with_tools(
             try:
                 response = await client.chat.completions.create(
                     **req_kwargs,
-                    extra_body={"thinking": {"type": "disabled"}},
+                    extra_body={"thinking": {"type": thinking_type}},
                 )
             except Exception:
                 response = await client.chat.completions.create(**req_kwargs)
@@ -667,6 +670,9 @@ async def openai_chat_with_tools(
             "role": "assistant",
             "content": msg.content or "",
         }
+        reasoning_content = getattr(msg, "reasoning_content", None)
+        if reasoning_content and norm_tool_calls:
+            out["reasoning_content"] = reasoning_content
         if norm_tool_calls:
             out["tool_calls"] = norm_tool_calls
         return out
@@ -682,14 +688,14 @@ async def openai_chat_with_tools(
         "model": resolved_model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        "max_tokens": effective_max_tokens,
     }
     if tools:
         payload["tools"] = tools
         if tool_choice:
             payload["tool_choice"] = tool_choice
     if is_flash_model:
-        payload["thinking"] = {"type": "disabled"}
+        payload["thinking"] = {"type": thinking_type}
 
     async with httpx.AsyncClient() as http_client:
         response = await http_client.post(
@@ -713,6 +719,8 @@ async def openai_chat_with_tools(
             "role": "assistant",
             "content": msg_dict.get("content") or "",
         }
+        if msg_dict.get("reasoning_content") and msg_dict.get("tool_calls"):
+            out["reasoning_content"] = msg_dict["reasoning_content"]
         if msg_dict.get("tool_calls"):
             out["tool_calls"] = msg_dict["tool_calls"]
         return out

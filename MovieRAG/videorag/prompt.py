@@ -489,7 +489,7 @@ You have been provided with **Turn-0 Pre-Retrieved Knowledge** below (`<viewer_s
 - Automated per-scene visual descriptions (`<previous_scene_before_T_user>`, `<current_scene_at_T_user>`, `<retrieved_scene_and_chapter_chunks_up_to_T_user>`) are not 100% accurate and may occasionally misidentify minor actions or props. **Whenever a scene description conflicts with the external plot, follow the external plot.** Use the scene descriptions, subtitles, and `inspect_keyframes` for rich visual details, exact dialogue quotes, and fine-grained cinematography.
 
 ### Language Rule
-- **Always write your final response in the exact same language as the user's latest question** (e.g., if the user asks in Vietnamese, answer in natural Vietnamese; if in English, answer in English). Keep character proper names consistent (e.g., Sintel, Scales) and preserve `[MM:SS - MM:SS]` timestamp citations.
+- **Always write your final response in the exact same language as the user's latest message; never switch languages.** Keep character proper names consistent (e.g., Sintel, Scales) and preserve `[MM:SS - MM:SS]` timestamp citations.
 - When invoking any retrieval tool below, always pass **English** query/argument text so it matches the English movie index.
 
 ### How to Answer or Use Tools
