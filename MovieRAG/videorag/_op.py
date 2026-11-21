@@ -465,6 +465,15 @@ def _clean_extracted_field(raw: str) -> str:
     return clean_str(raw).strip().strip('"').strip("'").strip()
 
 
+def _normalize_entity_name(raw: str) -> str:
+    name = _clean_extracted_field(raw).upper()
+    for article in ("THE ", "A ", "AN "):
+        if name.startswith(article) and len(name) > len(article):
+            name = name[len(article):].strip()
+            break
+    return name
+
+
 async def _handle_single_entity_extraction(
     record_attributes: list[str],
     chunk_key: str,
@@ -472,7 +481,7 @@ async def _handle_single_entity_extraction(
 ):
     if len(record_attributes) < 4 or _clean_extracted_field(record_attributes[0]).lower() != "entity":
         return None
-    entity_name = _clean_extracted_field(record_attributes[1]).upper()
+    entity_name = _normalize_entity_name(record_attributes[1])
     if not entity_name:
         return None
     entity_type = _clean_extracted_field(record_attributes[2]).upper()
@@ -498,8 +507,8 @@ async def _handle_single_relationship_extraction(
 ):
     if len(record_attributes) < 5 or _clean_extracted_field(record_attributes[0]).lower() != "relationship":
         return None
-    source = _clean_extracted_field(record_attributes[1]).upper()
-    target = _clean_extracted_field(record_attributes[2]).upper()
+    source = _normalize_entity_name(record_attributes[1])
+    target = _normalize_entity_name(record_attributes[2])
     if not source or not target:
         return None
     edge_description = _clean_extracted_field(record_attributes[3])
@@ -569,13 +578,20 @@ def _merge_temporal_slices(
         ),
     )
 
-    non_full_movie_starts = [
+    scene_starts = [
         float(d["start_time"])
         for d in temporal_list
-        if d.get("tier") != "full_movie"
+        if d.get("tier") == "scene"
     ]
-    if non_full_movie_starts:
-        first_seen_time = min(non_full_movie_starts)
+    chapter_starts = [
+        float(d["start_time"])
+        for d in temporal_list
+        if d.get("tier") == "chapter"
+    ]
+    if scene_starts:
+        first_seen_time = min(scene_starts)
+    elif chapter_starts:
+        first_seen_time = min(chapter_starts)
     elif temporal_list:
         # Entity appears ONLY in full_movie plot document -> set first_seen_time to movie end
         first_seen_time = max(float(d.get("end_time", 0.0)) for d in temporal_list)
@@ -949,7 +965,11 @@ async def _find_most_related_segments_from_entities(
             if c_id in all_text_units_lookup:
                 continue
             chunk_dp = await text_chunks_db.get_by_id(c_id)
-            if chunk_dp is None or not is_chunk_allowed(chunk_dp, T_user, spoiler_free):
+            if (
+                chunk_dp is None
+                or chunk_dp.get("tier", "scene") != "scene"
+                or not is_chunk_allowed(chunk_dp, T_user, spoiler_free)
+            ):
                 continue
             relation_counts = 0
             if this_edges:
@@ -991,6 +1011,7 @@ async def _reconstruct_graph_entities_and_relations_context(
     character_glossary: Optional[Dict[str, str]] = None,
     max_entities: int = 8,
     max_relations: int = 10,
+    max_slices_per_entity: Optional[int] = 6,
 ) -> str:
     """Reconstruct spoiler-filtered Entity & 1-Hop Relationship Histories from temporal_descriptions."""
     if not node_datas:
@@ -1018,6 +1039,8 @@ async def _reconstruct_graph_entities_and_relations_context(
     if not kept_nodes:
         return "  (No matching graph entities introduced up to current timestamp)"
 
+    kept_node_names: Set[str] = {n["entity_name"] for n in kept_nodes}
+
     for node in kept_nodes:
         ent_name = node["entity_name"]
         fst = float(node.get("first_seen_time", 0.0))
@@ -1042,7 +1065,20 @@ async def _reconstruct_graph_entities_and_relations_context(
             d for d in t_slices if is_temporal_slice_allowed(d, T_user, spoiler_free)
         ]
         if allowed_slices:
-            for d in allowed_slices[:6]:
+            if (
+                max_slices_per_entity is not None
+                and max_slices_per_entity > 0
+                and len(allowed_slices) > max_slices_per_entity
+            ):
+                if max_slices_per_entity == 1:
+                    selected_slices = [allowed_slices[0]]
+                else:
+                    selected_slices = [allowed_slices[0]] + allowed_slices[
+                        -(max_slices_per_entity - 1) :
+                    ]
+            else:
+                selected_slices = allowed_slices
+            for d in selected_slices:
                 st_str = _format_mmss(float(d.get("start_time", 0.0)))
                 et_str = _format_mmss(float(d.get("end_time", 0.0)))
                 tier_tag = f" ({d['tier']})" if d.get("tier") in ("chapter", "full_movie") else ""
@@ -1054,9 +1090,9 @@ async def _reconstruct_graph_entities_and_relations_context(
             lines.append(f"  Entity [{ent_name}] (first seen {_format_mmss(fst)}):")
             lines.extend(ent_lines)
 
-    # 1-hop edges connected to kept_nodes
+    # 1-hop edges connected to kept_nodes: collect all spoiler-safe candidates, then prioritize & sort
     seen_edges: Set[Tuple[str, str]] = set()
-    rel_count = 0
+    candidate_edges: List[Dict[str, Any]] = []
     for node in kept_nodes:
         ent_name = node["entity_name"]
         node_edges = await knowledge_graph_inst.get_node_edges(ent_name)
@@ -1091,22 +1127,43 @@ async def _reconstruct_graph_entities_and_relations_context(
             allowed_edge_slices = [
                 d for d in edge_slices if is_temporal_slice_allowed(d, T_user, spoiler_free)
             ]
-            if allowed_edge_slices:
-                lines.append(f"  Relation [{edge_key[0]} <-> {edge_key[1]}]:")
-                for d in allowed_edge_slices[:4]:
-                    st_str = _format_mmss(float(d.get("start_time", 0.0)))
-                    et_str = _format_mmss(float(d.get("end_time", 0.0)))
-                    lines.append(f"    - [{st_str} - {et_str}]: {d['description']}")
-                rel_count += 1
-            elif not spoiler_free and edge_data.get("description"):
-                lines.append(f"  Relation [{edge_key[0]} <-> {edge_key[1]}]:")
-                lines.append(f"    - [Summary]: {edge_data['description']}")
-                rel_count += 1
+            if not allowed_edge_slices and (spoiler_free or not edge_data.get("description")):
+                continue
 
-            if rel_count >= max_relations:
-                break
-        if rel_count >= max_relations:
-            break
+            both_in_kept = (
+                1 if (edge_key[0] in kept_node_names and edge_key[1] in kept_node_names) else 0
+            )
+            edge_weight = float(edge_data.get("weight", 1.0))
+            most_recent_end = max(
+                (float(d.get("end_time", 0.0)) for d in allowed_edge_slices),
+                default=edge_fst,
+            )
+            candidate_edges.append(
+                {
+                    "edge_key": edge_key,
+                    "both_in_kept": both_in_kept,
+                    "weight": edge_weight,
+                    "most_recent_end": most_recent_end,
+                    "allowed_slices": allowed_edge_slices,
+                    "description": edge_data.get("description", ""),
+                }
+            )
+
+    candidate_edges.sort(
+        key=lambda e: (-e["both_in_kept"], -e["weight"], -e["most_recent_end"])
+    )
+
+    for cand in candidate_edges[:max_relations]:
+        edge_key = cand["edge_key"]
+        allowed_edge_slices = cand["allowed_slices"]
+        lines.append(f"  Relation [{edge_key[0]} <-> {edge_key[1]}]:")
+        if allowed_edge_slices:
+            for d in allowed_edge_slices[:4]:
+                st_str = _format_mmss(float(d.get("start_time", 0.0)))
+                et_str = _format_mmss(float(d.get("end_time", 0.0)))
+                lines.append(f"    - [{st_str} - {et_str}]: {d['description']}")
+        else:
+            lines.append(f"    - [Summary]: {cand['description']}")
 
     return "\n".join(lines) if lines else "  (No spoiler-safe entity history available up to current timestamp)"
 
@@ -1671,7 +1728,7 @@ def _build_spoiler_gated_tool_executors(
         return "\n\n".join(blocks)
 
     async def get_character_history(character_name: str) -> str:
-        target = (character_name or "").strip().upper()
+        target = _normalize_entity_name(character_name or "")
         if not target:
             return "Please provide a non-empty character_name."
 
@@ -1705,6 +1762,7 @@ def _build_spoiler_gated_tool_executors(
             character_glossary=character_glossary,
             max_entities=3,
             max_relations=8,
+            max_slices_per_entity=None,
         )
 
     async def get_adjacent_scenes(
