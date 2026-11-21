@@ -1337,27 +1337,42 @@ async def _build_turn0_context(
         f"</viewer_state>"
     )
 
-    # 2. Active Scene at T_user
+    # 2. Active Scene at T_user & Immediately Preceding Scene
     active_scene_id: Optional[str] = None
     active_scene_seg: Optional[dict] = None
+    active_idx: Optional[int] = None
     if T_user is not None and ordered_scenes:
         t_val = float(T_user)
-        for s_id, seg in ordered_scenes:
+        for idx, (s_id, seg) in enumerate(ordered_scenes):
             st = float(seg.get("start_time", 0.0))
             et = float(seg.get("end_time", 0.0))
             if st <= t_val <= et:
                 active_scene_id = s_id
                 active_scene_seg = seg
+                active_idx = idx
                 break
         if active_scene_id is None:
             # Pick the most recent scene that started at or before T_user
             prior = [
-                (s_id, seg)
-                for s_id, seg in ordered_scenes
+                (idx, s_id, seg)
+                for idx, (s_id, seg) in enumerate(ordered_scenes)
                 if float(seg.get("start_time", 0.0)) <= t_val
             ]
             if prior:
-                active_scene_id, active_scene_seg = prior[-1]
+                active_idx, active_scene_id, active_scene_seg = prior[-1]
+
+    prev_scene_id: Optional[str] = None
+    prev_scene_xml: Optional[str] = None
+    if active_idx is not None and active_idx > 0:
+        prev_scene_id, prev_scene_seg = ordered_scenes[active_idx - 1]
+        prev_scene_text = format_scene_segment_for_timestamp(
+            prev_scene_id, prev_scene_seg, T_user=T_user, spoiler_free=spoiler_free
+        )
+        prev_scene_xml = (
+            f"<previous_scene_before_T_user>\n"
+            f"{prev_scene_text}\n"
+            f"</previous_scene_before_T_user>"
+        )
 
     if active_scene_id and active_scene_seg:
         active_scene_text = format_scene_segment_for_timestamp(
@@ -1457,6 +1472,8 @@ async def _build_turn0_context(
     # 5. Union of Direct Vector Chunks + 1-Hop Graph Co-Occurrence Scenes
     formatted_retrieved_blocks: List[str] = []
     included_scene_ids: Set[str] = set()
+    if prev_scene_id:
+        included_scene_ids.add(prev_scene_id)
     vector_chunks = await text_chunks_db.get_by_ids(vector_chunk_ids)
 
     for c_id, c_dp in zip(vector_chunk_ids, vector_chunks):
@@ -1529,13 +1546,16 @@ async def _build_turn0_context(
         f"</retrieved_scene_and_chapter_chunks_up_to_T_user>"
     )
 
-    turn0_context = "\n\n".join(
-        [viewer_state_xml, current_scene_xml, graph_xml, retrieved_xml]
-    )
+    turn0_blocks = [viewer_state_xml]
+    if prev_scene_xml:
+        turn0_blocks.append(prev_scene_xml)
+    turn0_blocks.extend([current_scene_xml, graph_xml, retrieved_xml])
+    turn0_context = "\n\n".join(turn0_blocks)
     meta_info = {
         "movie_id": movie_id,
         "movie_title": movie_title,
         "character_glossary": character_glossary,
+        "prev_scene_id": prev_scene_id,
         "active_scene_id": active_scene_id,
         "included_scene_ids": list(included_scene_ids),
     }
@@ -1640,6 +1660,13 @@ AGENT_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "visual_question": {
                         "type": "string",
                         "description": "Specific visual question about clothing, weapons, posture, expressions, or background details.",
+                    },
+                    "target_timestamp": {
+                        "type": "number",
+                        "description": (
+                            "Optional target timestamp in seconds within the scene (e.g. 105.0 for 01:45) "
+                            "to focus keyframe selection on the 4 frames closest to that moment."
+                        ),
                     },
                 },
                 "required": ["scene_id", "visual_question"],
@@ -1796,7 +1823,11 @@ def _build_spoiler_gated_tool_executors(
             )
         return "\n\n".join(blocks)
 
-    async def inspect_keyframes(scene_id: str, visual_question: str) -> str:
+    async def inspect_keyframes(
+        scene_id: str,
+        visual_question: str,
+        target_timestamp: Optional[float] = None,
+    ) -> str:
         if scene_id not in scene_map:
             return f"Scene '{scene_id}' not found in video_segments."
         seg = scene_map[scene_id]
@@ -1819,12 +1850,27 @@ def _build_spoiler_gated_tool_executors(
         if not allowed_kfs and raw_kfs:
             allowed_kfs = [raw_kfs[0]]
 
-        # Select up to 4 sharp, temporally spread keyframes
+        # Select up to 4 keyframes: either closest to target_timestamp (clamped <= T_user) or evenly spread
         if len(allowed_kfs) > 4:
-            indices = [
-                int(round(i * (len(allowed_kfs) - 1) / 3.0)) for i in range(4)
-            ]
-            selected_kfs = [allowed_kfs[i] for i in indices]
+            if target_timestamp is not None:
+                t_target = float(target_timestamp)
+                if spoiler_free and T_user is not None:
+                    t_target = min(t_target, float(T_user))
+                closest_four = sorted(
+                    allowed_kfs,
+                    key=lambda kf: abs(
+                        float(kf.get("timestamp", seg.get("start_time", 0.0))) - t_target
+                    ),
+                )[:4]
+                selected_kfs = sorted(
+                    closest_four,
+                    key=lambda kf: float(kf.get("timestamp", seg.get("start_time", 0.0))),
+                )
+            else:
+                indices = [
+                    int(round(i * (len(allowed_kfs) - 1) / 3.0)) for i in range(4)
+                ]
+                selected_kfs = [allowed_kfs[i] for i in indices]
         else:
             selected_kfs = allowed_kfs
 

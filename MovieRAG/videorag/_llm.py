@@ -518,33 +518,57 @@ async def deepseek_complete_if_cache(
             return if_cache_return["return"]
 
     client = get_deepseek_async_client_instance(api_key=api_key, base_url=base_url)
+    is_flash_model = "flash" in str(model or "").lower()
     if client is not None:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=kwargs.get("temperature", 0.3),
-            max_tokens=kwargs.get("max_tokens", 4096),
-        )
+        req_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": kwargs.get("temperature", 0.3),
+            "max_tokens": kwargs.get("max_tokens", 4096),
+        }
+        if is_flash_model:
+            try:
+                response = await client.chat.completions.create(
+                    **req_kwargs,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+            except Exception:
+                response = await client.chat.completions.create(**req_kwargs)
+        else:
+            response = await client.chat.completions.create(**req_kwargs)
         content = response.choices[0].message.content or ""
     else:
         import httpx
 
         url = _normalize_chat_completions_url(base_url)
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": kwargs.get("temperature", 0.3),
+            "max_tokens": kwargs.get("max_tokens", 4096),
+        }
+        if is_flash_model:
+            payload["thinking"] = {"type": "disabled"}
+
         async with httpx.AsyncClient() as http_client:
             response = await http_client.post(
                 url,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": kwargs.get("temperature", 0.3),
-                    "max_tokens": kwargs.get("max_tokens", 4096),
-                },
+                headers=headers,
+                json=payload,
                 timeout=60.0,
             )
+            if is_flash_model and response.status_code in (400, 422):
+                payload.pop("thinking", None)
+                response = await http_client.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=60.0,
+                )
             response.raise_for_status()
             result = response.json()
             content = result["choices"][0]["message"].get("content") or ""
@@ -576,7 +600,7 @@ async def deepseek_complete(
 async def openai_chat_with_tools(
     messages: list[dict],
     tools: Optional[list[dict]] = None,
-    model: str = "deepseek-chat",
+    model: Optional[str] = None,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     temperature: float = 0.2,
@@ -599,12 +623,14 @@ async def openai_chat_with_tools(
         ]
     }
     """
+    resolved_model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
+    is_flash_model = "flash" in str(resolved_model).lower()
     resolved_key = api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY") or "sk-*******"
     client = get_deepseek_async_client_instance(api_key=resolved_key, base_url=base_url)
 
     if client is not None:
         req_kwargs: Dict[str, Any] = {
-            "model": model,
+            "model": resolved_model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -613,7 +639,16 @@ async def openai_chat_with_tools(
             req_kwargs["tools"] = tools
             if tool_choice:
                 req_kwargs["tool_choice"] = tool_choice
-        response = await client.chat.completions.create(**req_kwargs)
+        if is_flash_model:
+            try:
+                response = await client.chat.completions.create(
+                    **req_kwargs,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+            except Exception:
+                response = await client.chat.completions.create(**req_kwargs)
+        else:
+            response = await client.chat.completions.create(**req_kwargs)
         msg = response.choices[0].message
         norm_tool_calls = []
         if getattr(msg, "tool_calls", None):
@@ -639,8 +674,12 @@ async def openai_chat_with_tools(
     import httpx
 
     url = _normalize_chat_completions_url(base_url)
+    headers = {
+        "Authorization": f"Bearer {resolved_key}",
+        "Content-Type": "application/json",
+    }
     payload: Dict[str, Any] = {
-        "model": model,
+        "model": resolved_model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -649,17 +688,24 @@ async def openai_chat_with_tools(
         payload["tools"] = tools
         if tool_choice:
             payload["tool_choice"] = tool_choice
+    if is_flash_model:
+        payload["thinking"] = {"type": "disabled"}
 
     async with httpx.AsyncClient() as http_client:
         response = await http_client.post(
             url,
-            headers={
-                "Authorization": f"Bearer {resolved_key}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             json=payload,
             timeout=90.0,
         )
+        if is_flash_model and response.status_code in (400, 422):
+            payload.pop("thinking", None)
+            response = await http_client.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=90.0,
+            )
         response.raise_for_status()
         result = response.json()
         msg_dict = result["choices"][0]["message"]
@@ -986,7 +1032,7 @@ async def vision_subtool_complete(
         return (result["choices"][0]["message"].get("content") or "").strip()
 
 
-# DeepSeek + Local/API Embeddings (default 768-dim nomic-embed-text)
+# DeepSeek + Local/API Embeddings (default 768-dim nomic-embed-text, deepseek-flash)
 deepseek_config = LLMConfig(
     embedding_func_raw=local_or_api_embedding,
     embedding_model_name=os.environ.get("MOVIERAG_EMBEDDING_MODEL", "nomic-embed-text"),
@@ -996,16 +1042,16 @@ deepseek_config = LLMConfig(
     embedding_func_max_async=16,
     query_better_than_threshold=0.2,
     best_model_func_raw=deepseek_complete,
-    best_model_name="deepseek-chat",
+    best_model_name=os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"),
     best_model_max_token_size=32768,
     best_model_max_async=16,
     cheap_model_func_raw=deepseek_complete,
-    cheap_model_name="deepseek-chat",
+    cheap_model_name=os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"),
     cheap_model_max_token_size=32768,
     cheap_model_max_async=16,
 )
 
-# DeepSeek + SiliconFlow BAAI/bge-m3 (1024-dim)
+# DeepSeek + SiliconFlow BAAI/bge-m3 (1024-dim, deepseek-flash)
 deepseek_bge_config = LLMConfig(
     embedding_func_raw=bge_m3_embedding,
     embedding_model_name="BAAI/bge-m3",
@@ -1015,11 +1061,11 @@ deepseek_bge_config = LLMConfig(
     embedding_func_max_async=16,
     query_better_than_threshold=0.2,
     best_model_func_raw=deepseek_complete,
-    best_model_name="deepseek-chat",
+    best_model_name=os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"),
     best_model_max_token_size=32768,
     best_model_max_async=16,
     cheap_model_func_raw=deepseek_complete,
-    cheap_model_name="deepseek-chat",
+    cheap_model_name=os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"),
     cheap_model_max_token_size=32768,
     cheap_model_max_async=16,
 )

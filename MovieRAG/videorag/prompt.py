@@ -478,7 +478,7 @@ PROMPTS[
 
 {spoiler_guardrail}
 
-You have been provided with **Turn-0 Pre-Retrieved Knowledge** below (`<viewer_state>`, `<current_scene_at_T_user>`, `<graph_entities_and_relations_up_to_T_user>`, and `<retrieved_scene_and_chapter_chunks_up_to_T_user>`).
+You have been provided with **Turn-0 Pre-Retrieved Knowledge** below (`<viewer_state>`, `<previous_scene_before_T_user>`, `<current_scene_at_T_user>`, `<graph_entities_and_relations_up_to_T_user>`, and `<retrieved_scene_and_chapter_chunks_up_to_T_user>`).
 
 ### How to Answer or Use Tools
 1. **Check Turn-0 Context First**: If the Turn-0 context already contains sufficient grounded evidence to answer the user's question accurately, synthesize your final answer immediately without calling any tools (0 tool calls).
@@ -486,7 +486,7 @@ You have been provided with **Turn-0 Pre-Retrieved Knowledge** below (`<viewer_s
    - Call `search_scenes(query, start_time, end_time)` if you need to locate specific scenes or events not present in the Turn-0 chunks.
    - Call `get_character_history(character_name)` if you need a character's complete chronological actions and 1-hop relationships up to the viewer's timestamp.
    - Call `get_adjacent_scenes(scene_id, before, after)` if you need to see what happened immediately before or after a specific scene.
-   - Call `inspect_keyframes(scene_id, visual_question)` when the user asks about a fine-grained visual detail (e.g., exact appearance, object held, posture, background detail, facial expression) that is not explicitly stated in the scene text caption.
+   - Call `inspect_keyframes(scene_id, visual_question, target_timestamp)` when the user asks about a fine-grained visual detail (e.g., exact appearance, object held, posture, background detail, facial expression) that is not explicitly stated in the scene text caption. Pass `target_timestamp` (in seconds) when focusing on a specific moment inside the scene.
 3. **Citation & Grounding Rules**:
    - Ground every claim in the retrieved scenes, dialogues, keyframes, or graph histories. Do not fabricate events.
    - {citation_instruction}
