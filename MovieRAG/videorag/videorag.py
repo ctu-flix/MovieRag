@@ -147,6 +147,9 @@ class VideoRAG:
                 self.addon_params.setdefault(
                     "character_glossary", b_meta.get("character_glossary", {})
                 )
+                self.addon_params.setdefault(
+                    "external_plot_documents", b_meta.get("external_plot_documents", [])
+                )
             except Exception as exc:
                 logger.warning(f"Failed to preload bundle metadata from {bundle_in_workdir}: {exc}")
 
@@ -258,6 +261,7 @@ class VideoRAG:
         self.addon_params["movie_title"] = movie_title
         self.addon_params["duration_sec"] = duration_sec
         self.addon_params["character_glossary"] = character_glossary
+        self.addon_params["external_plot_documents"] = external_plot_docs
 
         # 1. Populate self.video_segments and build Tier 1 (1 Scene = 1 Rich Chunk)
         segments_info: Dict[str, Dict[str, Any]] = {}

@@ -1173,9 +1173,10 @@ async def _resolve_query_with_chat_history(
     query_param: QueryParam,
     global_config: dict,
 ) -> str:
-    """Resolve pronouns and deictics in follow-up questions against the last 6 messages (3 turns) of chat_history."""
+    """Resolve pronouns against chat_history[-6:] and translate non-English queries into standalone English for retrieval."""
     history = (query_param.chat_history or [])[-6:]
-    if not history:
+    has_non_ascii = any(ord(ch) > 127 for ch in (query or ""))
+    if not history and not has_non_ascii:
         return query
     use_llm_func: callable = global_config["llm"]["cheap_model_func"]
     history_lines = []
@@ -1184,11 +1185,11 @@ async def _resolve_query_with_chat_history(
         content = (msg.get("content") or "").strip()
         if content:
             history_lines.append(f"{role}: {content}")
-    if not history_lines:
+    if not history_lines and not has_non_ascii:
         return query
 
     prompt = PROMPTS["query_coref_resolution"].format(
-        chat_history_text="\n".join(history_lines),
+        chat_history_text="\n".join(history_lines) if history_lines else "(None)",
         input_text=query,
     )
     try:
@@ -1196,7 +1197,7 @@ async def _resolve_query_with_chat_history(
         rewritten = (rewritten or "").strip().strip('"')
         return rewritten if rewritten else query
     except Exception as exc:
-        logger.warning(f"Coreference resolution fallback to raw query ({exc})")
+        logger.warning(f"Coreference/translation resolution fallback to raw query ({exc})")
         return query
 
 
@@ -1259,9 +1260,12 @@ def _get_all_scenes_flat(video_segments: BaseKVStorage) -> Tuple[str, Dict[str, 
 
 
 def _load_bundle_meta_from_workdir(global_config: dict) -> Dict[str, Any]:
-    """Load movie_title, duration_sec, character_glossary from addon_params or working_dir/movie_knowledge_bundle.json."""
-    addon = global_config.get("addon_params") or {}
-    if addon.get("character_glossary") or addon.get("movie_title"):
+    """Load movie_title, duration_sec, character_glossary, and external_plot_documents from addon_params or working_dir."""
+    addon = dict(global_config.get("addon_params") or {})
+    if (
+        (addon.get("character_glossary") or addon.get("movie_title"))
+        and "external_plot_documents" in addon
+    ):
         return addon
     wdir = global_config.get("working_dir", "")
     bundle_file = os.path.join(wdir, "movie_knowledge_bundle.json")
@@ -1269,15 +1273,59 @@ def _load_bundle_meta_from_workdir(global_config: dict) -> Dict[str, Any]:
         try:
             with open(bundle_file, "r", encoding="utf-8") as f:
                 b = json.load(f)
-            return {
-                "movie_id": b.get("movie_id", ""),
-                "movie_title": b.get("movie_title", ""),
-                "duration_sec": b.get("duration_sec", 0.0),
-                "character_glossary": b.get("character_glossary", {}),
-            }
+            addon.setdefault("movie_id", b.get("movie_id", ""))
+            addon.setdefault("movie_title", b.get("movie_title", ""))
+            addon.setdefault("duration_sec", b.get("duration_sec", 0.0))
+            addon.setdefault("character_glossary", b.get("character_glossary", {}))
+            addon.setdefault(
+                "external_plot_documents", b.get("external_plot_documents", [])
+            )
+            return addon
         except Exception:
             pass
     return addon
+
+
+def _extract_unlocked_external_plot_blocks(
+    external_plot_documents: Optional[List[Dict[str, Any]]],
+    T_user: Optional[float],
+    spoiler_free: bool = True,
+) -> List[str]:
+    """Extract timestamped authoritative external-plot blocks up to T_user.
+
+    - When `spoiler_free=True` and `T_user` is set: includes only completed timestamped blocks
+      whose header `(MM:SS - MM:SS)` has `end_sec <= T_user` so future plot beats never leak.
+    - When `spoiler_free=False` (or `T_user is None`): includes all external plot blocks.
+    """
+    if not external_plot_documents:
+        return []
+
+    range_re = re.compile(
+        r"\((\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)\)"
+    )
+    unlocked: List[str] = []
+    for doc in external_plot_documents:
+        if not isinstance(doc, dict):
+            continue
+        content = (doc.get("content") or "").strip()
+        if not content:
+            continue
+        blocks = [b.strip() for b in re.split(r"\n\s*\n", content) if b.strip()]
+        if not spoiler_free or T_user is None:
+            unlocked.extend(blocks)
+            continue
+
+        t_cut = float(T_user)
+        for blk in blocks:
+            first_line = blk.splitlines()[0]
+            m = range_re.search(first_line)
+            if not m:
+                continue
+            start_s = _parse_mmss_to_sec(m.group(1))
+            end_s = _parse_mmss_to_sec(m.group(2))
+            if start_s is not None and end_s is not None and end_s <= t_cut:
+                unlocked.append(blk)
+    return unlocked
 
 
 async def _build_turn0_context(
@@ -1298,6 +1346,7 @@ async def _build_turn0_context(
     movie_id, scene_map, ordered_scenes = _get_all_scenes_flat(video_segments)
     movie_title = bundle_meta.get("movie_title") or movie_id.replace("_", " ").title()
     character_glossary = bundle_meta.get("character_glossary") or {}
+    external_plot_documents = bundle_meta.get("external_plot_documents") or []
 
     # 1. Viewer State & Unlocked Chapters Table of Contents
     t_str = (
@@ -1474,6 +1523,8 @@ async def _build_turn0_context(
     included_scene_ids: Set[str] = set()
     if prev_scene_id:
         included_scene_ids.add(prev_scene_id)
+    if active_scene_id:
+        included_scene_ids.add(active_scene_id)
     vector_chunks = await text_chunks_db.get_by_ids(vector_chunk_ids)
 
     for c_id, c_dp in zip(vector_chunk_ids, vector_chunks):
@@ -1546,7 +1597,21 @@ async def _build_turn0_context(
         f"</retrieved_scene_and_chapter_chunks_up_to_T_user>"
     )
 
+    unlocked_plot_blocks = _extract_unlocked_external_plot_blocks(
+        external_plot_documents, T_user=T_user, spoiler_free=spoiler_free
+    )
+    authoritative_plot_xml: Optional[str] = None
+    if unlocked_plot_blocks:
+        plot_body = "\n\n".join(unlocked_plot_blocks)
+        authoritative_plot_xml = (
+            f"<authoritative_plot_timeline_up_to_T_user>\n"
+            f"{plot_body}\n"
+            f"</authoritative_plot_timeline_up_to_T_user>"
+        )
+
     turn0_blocks = [viewer_state_xml]
+    if authoritative_plot_xml:
+        turn0_blocks.append(authoritative_plot_xml)
     if prev_scene_xml:
         turn0_blocks.append(prev_scene_xml)
     turn0_blocks.extend([current_scene_xml, graph_xml, retrieved_xml])

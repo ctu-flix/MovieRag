@@ -460,8 +460,12 @@ STRICT SPOILER-ISOLATION RULES:
 
 PROMPTS[
     "query_coref_resolution"
-] = """Given the recent conversation history and the user's latest follow-up question about an animated movie, rewrite the latest question into a standalone, self-contained search query that resolves all pronouns ("he", "she", "they", "it", "that", "there", "him", "her") and implicit references.
-If the latest question is already self-contained, return it unchanged. Output ONLY the rewritten query text with no extra commentary.
+] = """Given the recent conversation history (if any) and the user's latest question about an animated movie, rewrite the latest question into a standalone, self-contained **English** search query for retrieving scenes and entities from an English movie database.
+Rules:
+1. Resolve all pronouns ("he", "she", "they", "it", "that", "there", "him", "her", or equivalent pronouns in any language) and implicit references using the conversation history.
+2. If the latest question is in a non-English language (e.g., Vietnamese, Japanese, Chinese, Spanish, etc.), translate it accurately into natural English while preserving character names (e.g., Sintel, Scales, Shaman, Gatekeeper).
+3. If the latest question is already self-contained English, return it unchanged.
+4. Output ONLY the standalone English query text with no extra commentary.
 
 ---Recent Conversation History---
 {chat_history_text}
@@ -469,7 +473,7 @@ If the latest question is already self-contained, return it unchanged. Output ON
 ---Latest User Question---
 {input_text}
 
----Standalone Rewritten Query---
+---Standalone English Search Query---
 """
 
 PROMPTS[
@@ -478,7 +482,15 @@ PROMPTS[
 
 {spoiler_guardrail}
 
-You have been provided with **Turn-0 Pre-Retrieved Knowledge** below (`<viewer_state>`, `<previous_scene_before_T_user>`, `<current_scene_at_T_user>`, `<graph_entities_and_relations_up_to_T_user>`, and `<retrieved_scene_and_chapter_chunks_up_to_T_user>`).
+You have been provided with **Turn-0 Pre-Retrieved Knowledge** below (`<viewer_state>`, `<authoritative_plot_timeline_up_to_T_user>`, `<previous_scene_before_T_user>`, `<current_scene_at_T_user>`, `<graph_entities_and_relations_up_to_T_user>`, and `<retrieved_scene_and_chapter_chunks_up_to_T_user>`).
+
+### Source-of-Truth Hierarchy
+- Treat `<authoritative_plot_timeline_up_to_T_user>` (the canonical external plot) as the **primary source of truth** for story events, character identities, causality, and plot outcomes.
+- Automated per-scene visual descriptions (`<previous_scene_before_T_user>`, `<current_scene_at_T_user>`, `<retrieved_scene_and_chapter_chunks_up_to_T_user>`) are not 100% accurate and may occasionally misidentify minor actions or props. **Whenever a scene description conflicts with the external plot, follow the external plot.** Use the scene descriptions, subtitles, and `inspect_keyframes` for rich visual details, exact dialogue quotes, and fine-grained cinematography.
+
+### Language Rule
+- **Always write your final response in the exact same language as the user's latest question** (e.g., if the user asks in Vietnamese, answer in natural Vietnamese; if in English, answer in English). Keep character proper names consistent (e.g., Sintel, Scales) and preserve `[MM:SS - MM:SS]` timestamp citations.
+- When invoking any retrieval tool below, always pass **English** query/argument text so it matches the English movie index.
 
 ### How to Answer or Use Tools
 1. **Check Turn-0 Context First**: If the Turn-0 context already contains sufficient grounded evidence to answer the user's question accurately, synthesize your final answer immediately without calling any tools (0 tool calls).
@@ -488,7 +500,7 @@ You have been provided with **Turn-0 Pre-Retrieved Knowledge** below (`<viewer_s
    - Call `get_adjacent_scenes(scene_id, before, after)` if you need to see what happened immediately before or after a specific scene.
    - Call `inspect_keyframes(scene_id, visual_question, target_timestamp)` when the user asks about a fine-grained visual detail (e.g., exact appearance, object held, posture, background detail, facial expression) that is not explicitly stated in the scene text caption. Pass `target_timestamp` (in seconds) when focusing on a specific moment inside the scene.
 3. **Citation & Grounding Rules**:
-   - Ground every claim in the retrieved scenes, dialogues, keyframes, or graph histories. Do not fabricate events.
+   - Ground every claim in the authoritative plot, retrieved scenes, dialogues, keyframes, or graph histories. Do not fabricate events.
    - {citation_instruction}
    - Format your response in clear Markdown matching the requested style: {response_type}.
 
