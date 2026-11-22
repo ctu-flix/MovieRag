@@ -28,8 +28,13 @@ for _p in (str(MOVIERAG_PKG_DIR), str(REPO_ROOT)):
         sys.path.insert(0, _p)
 
 from api.app import create_app  # noqa: E402
+from api.guardrail import DEFAULT_REFUSAL_MESSAGE, check_movie_relevance  # noqa: E402
 from videorag import VideoRAG  # noqa: E402
 from videorag._llm import LLMConfig, _deterministic_ngram_hash_embedding  # noqa: E402
+
+
+async def _allow_all_guardrail(query: str, movie_title: str, chat_history=None):
+    return True, ""
 
 
 async def _mock_hash_embedding(model_name: str, texts: list[str]):
@@ -274,7 +279,12 @@ async def test_chat_spoiler_free_vs_full_movie(indexed_sintel_workdir: Path):
         always_create_working_dir=False,
     )
     rag.addon_params["chat_with_tools_func"] = _fake_chat_with_tools
-    app = create_app(movie_id="sintel", workdir=str(indexed_sintel_workdir), rag=rag)
+    app = create_app(
+        movie_id="sintel",
+        workdir=str(indexed_sintel_workdir),
+        rag=rag,
+        guardrail_func=_allow_all_guardrail,
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -328,7 +338,12 @@ async def test_chat_timestamp_parsing_and_validation(indexed_sintel_workdir: Pat
         always_create_working_dir=False,
     )
     rag.addon_params["chat_with_tools_func"] = _noop_chat
-    app = create_app(movie_id="sintel", workdir=str(indexed_sintel_workdir), rag=rag)
+    app = create_app(
+        movie_id="sintel",
+        workdir=str(indexed_sintel_workdir),
+        rag=rag,
+        guardrail_func=_allow_all_guardrail,
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -375,7 +390,12 @@ async def test_chat_history_capping_and_passthrough(indexed_sintel_workdir: Path
         always_create_working_dir=False,
     )
     rag.addon_params["chat_with_tools_func"] = _capture_chat
-    app = create_app(movie_id="sintel", workdir=str(indexed_sintel_workdir), rag=rag)
+    app = create_app(
+        movie_id="sintel",
+        workdir=str(indexed_sintel_workdir),
+        rag=rag,
+        guardrail_func=_allow_all_guardrail,
+    )
 
     # Build 10 messages (5 turns); service must cap to the last 6 messages (turns 3..5)
     ten_history_msgs = []
@@ -440,7 +460,12 @@ async def test_concurrent_chat_tool_calls_trace_isolation(indexed_sintel_workdir
         always_create_working_dir=False,
     )
     rag.addon_params["chat_with_tools_func"] = _concurrent_mock_chat
-    app = create_app(movie_id="sintel", workdir=str(indexed_sintel_workdir), rag=rag)
+    app = create_app(
+        movie_id="sintel",
+        workdir=str(indexed_sintel_workdir),
+        rag=rag,
+        guardrail_func=_allow_all_guardrail,
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -463,3 +488,124 @@ async def test_concurrent_chat_tool_calls_trace_isolation(indexed_sintel_workdir
         assert len(data_tool["tool_calls_trace"]) == 1
         assert data_tool["tool_calls_trace"][0]["tool"] == "get_adjacent_scenes"
         assert data_direct["tool_calls_trace"] == []
+
+
+@pytest.mark.anyio
+async def test_guardrail_blocks_off_topic_without_calling_rag(indexed_sintel_workdir: Path):
+    """Off-topic queries must return the guardrail refusal without invoking VideoRAG."""
+    rag_called = False
+
+    async def _should_not_be_called(messages: list[dict], tools=None, model=None, **kwargs) -> dict:
+        nonlocal rag_called
+        rag_called = True
+        return {"role": "assistant", "content": "Should never run"}
+
+    async def _mock_guardrail_llm(model_name: str, prompt: str, **kwargs) -> str:
+        if "quicksort" in prompt.lower():
+            return json.dumps(
+                {
+                    "is_movie_related": False,
+                    "refusal_message": "Sorry, that question is not related to movies.",
+                }
+            )
+        return json.dumps({"is_movie_related": True, "refusal_message": ""})
+
+    async def _guardrail_fn(query: str, movie_title: str, chat_history=None):
+        return await check_movie_relevance(
+            query=query,
+            movie_title=movie_title,
+            chat_history=chat_history,
+            llm_complete_fn=_mock_guardrail_llm,
+        )
+
+    rag = VideoRAG(
+        working_dir=str(indexed_sintel_workdir),
+        llm=_build_mock_llm_config(),
+        always_create_working_dir=False,
+    )
+    rag.addon_params["chat_with_tools_func"] = _should_not_be_called
+    app = create_app(
+        movie_id="sintel",
+        workdir=str(indexed_sintel_workdir),
+        rag=rag,
+        guardrail_func=_guardrail_fn,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/chat",
+            json={"query": "Write a Python quicksort algorithm", "current_timestamp": "02:00"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["answer"] == "Sorry, that question is not related to movies."
+        assert data["tool_calls_trace"] == []
+        assert data["effective_timestamp"] == 120.0
+        assert rag_called is False
+
+
+@pytest.mark.anyio
+async def test_guardrail_fail_closed_on_error_and_malformed_json():
+    """Fail-closed: exceptions or malformed JSON from the guardrail LLM must block the request."""
+
+    async def _raising_llm(model_name: str, prompt: str, **kwargs) -> str:
+        raise RuntimeError("Upstream timeout")
+
+    async def _bad_json_llm(model_name: str, prompt: str, **kwargs) -> str:
+        return "not valid json at all"
+
+    allowed_err, msg_err = await check_movie_relevance(
+        query="Who is Sintel?",
+        movie_title="Sintel",
+        llm_complete_fn=_raising_llm,
+    )
+    assert allowed_err is False
+    assert msg_err == DEFAULT_REFUSAL_MESSAGE
+
+    allowed_bad, msg_bad = await check_movie_relevance(
+        query="Who is Sintel?",
+        movie_title="Sintel",
+        llm_complete_fn=_bad_json_llm,
+    )
+    assert allowed_bad is False
+    assert msg_bad == DEFAULT_REFUSAL_MESSAGE
+
+
+@pytest.mark.anyio
+async def test_guardrail_can_be_disabled_via_env(
+    indexed_sintel_workdir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("MOVIERAG_GUARDRAIL_ENABLED", "false")
+    guardrail_invoked = False
+
+    async def _reject_all_guardrail(query: str, movie_title: str, chat_history=None):
+        nonlocal guardrail_invoked
+        guardrail_invoked = True
+        return False, "Blocked"
+
+    async def _ok_chat(messages: list[dict], tools=None, model=None, **kwargs) -> dict:
+        return {"role": "assistant", "content": "Bypassed guardrail successfully."}
+
+    rag = VideoRAG(
+        working_dir=str(indexed_sintel_workdir),
+        llm=_build_mock_llm_config(),
+        always_create_working_dir=False,
+    )
+    rag.addon_params["chat_with_tools_func"] = _ok_chat
+    app = create_app(
+        movie_id="sintel",
+        workdir=str(indexed_sintel_workdir),
+        rag=rag,
+        guardrail_func=_reject_all_guardrail,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/chat",
+            json={"query": "Write a Python quicksort algorithm", "current_timestamp": "02:00"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["answer"] == "Bypassed guardrail successfully."
+        assert guardrail_invoked is False

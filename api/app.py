@@ -11,7 +11,7 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +24,7 @@ for _p in (str(MOVIERAG_PKG_DIR), str(REPO_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from api.guardrail import check_movie_relevance  # noqa: E402
 from videorag import QueryParam, VideoRAG, deepseek_config  # noqa: E402
 from videorag._op import _parse_mmss_to_sec  # noqa: E402
 
@@ -252,13 +253,22 @@ class MovieRAGServiceState:
         }
 
 
+def _is_guardrail_enabled() -> bool:
+    raw = os.environ.get("MOVIERAG_GUARDRAIL_ENABLED", "true").strip().lower()
+    return raw not in ("0", "false", "off", "no", "disabled")
+
+
 def create_app(
     movie_id: Optional[str] = None,
     workdir: Optional[str] = None,
     rag: Optional[VideoRAG] = None,
+    guardrail_func: Optional[
+        Callable[[str, str, Optional[List[Dict[str, str]]]], Awaitable[Tuple[bool, str]]]
+    ] = None,
 ) -> FastAPI:
     """Factory to create the MovieRAG FastAPI service instance."""
     state = MovieRAGServiceState(movie_id=movie_id, workdir=workdir, rag=rag)
+    resolved_guardrail = guardrail_func or check_movie_relevance
 
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI):
@@ -341,6 +351,24 @@ def create_app(
             {"role": m.role, "content": m.content}
             for m in (payload.chat_history or [])[-6:]
         ]
+
+        # Pre-retrieval movie-relevance guardrail (isolated LLM call, fail-closed)
+        if _is_guardrail_enabled():
+            movie_title = str(
+                svc.rag.addon_params.get("movie_title") or svc.movie_id.title()
+            )
+            is_related, refusal_msg = await resolved_guardrail(
+                payload.query,
+                movie_title,
+                capped_history,
+            )
+            if not is_related:
+                return ChatResponse(
+                    answer=refusal_msg,
+                    tool_calls_trace=[],
+                    effective_timestamp=payload.current_timestamp,
+                    spoiler_free=payload.spoiler_free,
+                )
 
         query_param = QueryParam(
             mode="videorag",
